@@ -1,0 +1,18 @@
+{
+  "idf.currentSetup": "/home/robert/.espressif/v5.5.5/esp-idf",
+  "idf.openOcdConfigs": [
+    "interface/ftdi/esp_ftdi.cfg",
+    "target/esp32.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32"
+  },
+  "clangd.path": "/home/robert/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/robert/projects/roller-blinds-matter-controller/build"
+  ],
+  "idf.port": "/dev/ttyUSB0",
+  "idf.flashType": "UART"
+}
