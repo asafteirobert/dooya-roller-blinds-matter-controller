@@ -21,9 +21,14 @@
 #include <app/server/CommissioningWindowManager.h>
 #include <app/server/Server.h>
 
+#include <cstdint>
+
 #include "Constants.hpp"
 
 #include "ButtonDriver.hpp"
+#include "BlindController.hpp"
+#include "RadioController.hpp"
+#include "SX1276Driver.hpp"
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 #include <esp_matter_providers.h>
@@ -40,6 +45,9 @@ static const char *TAG = "app_main";
 uint16_t light_endpoint_id = 0;
 
 ButtonDriver buttonDriver;
+BlindController blindController; //TODO multiple instances when required
+RadioController radioController;
+SX1276Driver sx1276Driver;
 
 using namespace esp_matter;
 using namespace esp_matter::attribute;
@@ -204,6 +212,9 @@ extern "C" void app_main()
 
     // Initialize drivers
     buttonDriver.init();
+    sx1276Driver.init();
+    radioController.init(sx1276Driver);
+    blindController.init(radioController, 1);
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
     auto * dac_provider = get_dac_provider();
@@ -234,8 +245,6 @@ extern "C" void app_main()
     esp_matter::console::init();
 #endif
 
-    while (true)
-    {
-        vTaskDelay(10000 / portTICK_PERIOD_MS);
-    }
+    ESP_LOGI(TAG, "Init finished");
+    vTaskDelete(nullptr);
 }
