@@ -75,25 +75,43 @@ public:
 
     CHIP_ERROR HandleStopMotion() override
     {
+        // Triggers onBlindPositionChanged with the resting position, syncing the Current* attributes.
         blindController.stop();
 
+        // Per the Matter spec, Stop cancels any pending motion, so Target should collapse to Current.
+        // TargetPositionLiftPercent100ths is a nullable attribute, so it must be updated with a
+        // nullable value or esp_matter rejects the write with ESP_ERR_INVALID_ARG.
         uint8_t percentage = blindController.getPositionPercentage();
-        esp_matter_attr_val_t position_100ths = esp_matter_uint16(static_cast<uint16_t>(percentage) * 100);
-        attribute::update(window_covering_endpoint_id, WindowCovering::Id,
-                          WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id, &position_100ths);
+        esp_matter_attr_val_t position_100ths = esp_matter_nullable_uint16(nullable<uint16_t>(static_cast<uint16_t>(percentage) * 100));
         attribute::update(window_covering_endpoint_id, WindowCovering::Id,
                           WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id, &position_100ths);
-
-        // Kept in sync for clients (e.g. Home Assistant) that only read the legacy percentage attribute.
-        esp_matter_attr_val_t position_percentage = esp_matter_uint8(percentage);
-        attribute::update(window_covering_endpoint_id, WindowCovering::Id,
-                          WindowCovering::Attributes::CurrentPositionLiftPercentage::Id, &position_percentage);
 
         return CHIP_NO_ERROR;
     }
 };
 
 static BlindWindowCoveringDelegate windowCoveringDelegate;
+
+// Mirrors BlindController's current-position estimate into the Matter data model. Fired on
+// move start/interruption and on natural completion, so Home Assistant sees the resting
+// position even if a move gets redirected partway through. Does not touch the Target
+// attribute: on completion current == target already, and on interruption the Target
+// attribute has just been set to the new target by the caller of HandleMovement, so
+// overwriting it here would clobber that.
+// CurrentPositionLiftPercent100ths and CurrentPositionLiftPercentage were both created as nullable
+// attributes, so they must be updated with nullable values or esp_matter rejects the write with
+// ESP_ERR_INVALID_ARG (silently leaving the attribute, and Home Assistant's display, stale).
+static void onBlindPositionChanged(uint8_t percentage)
+{
+    esp_matter_attr_val_t position_100ths = esp_matter_nullable_uint16(nullable<uint16_t>(static_cast<uint16_t>(percentage) * 100));
+    attribute::update(window_covering_endpoint_id, WindowCovering::Id,
+                      WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id, &position_100ths);
+
+    // Kept in sync for clients (e.g. Home Assistant) that only read the legacy percentage attribute.
+    esp_matter_attr_val_t position_percentage = esp_matter_nullable_uint8(nullable<uint8_t>(percentage));
+    attribute::update(window_covering_endpoint_id, WindowCovering::Id,
+                      WindowCovering::Attributes::CurrentPositionLiftPercentage::Id, &position_percentage);
+}
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 extern const uint8_t cd_start[] asm("_binary_certification_declaration_der_start");
@@ -260,7 +278,7 @@ extern "C" void app_main()
     buttonDriver.init();
     sx1276Driver.init();
     radioController.init(sx1276Driver);
-    blindController.init(radioController, 1);
+    blindController.init(radioController, 1, onBlindPositionChanged);
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
     auto * dac_provider = get_dac_provider();

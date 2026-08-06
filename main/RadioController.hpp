@@ -6,6 +6,7 @@
 // gets commands from BlindController and sends Dooya radio commands to SX1276Driver
 class RadioController
 {
+    static constexpr char *TAG = "RadioController";
 public:
     enum class Command
     {
