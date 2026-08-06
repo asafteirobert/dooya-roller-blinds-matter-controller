@@ -18,6 +18,7 @@
 #include <common_macros.h>
 #include <log_heap_numbers.h>
 
+#include <app/clusters/window-covering-server/WindowCoveringDelegate.h>
 #include <app/server/CommissioningWindowManager.h>
 #include <app/server/Server.h>
 
@@ -42,7 +43,7 @@ using namespace chip::DeviceLayer;
 #endif
 
 static const char *TAG = "app_main";
-uint16_t light_endpoint_id = 0;
+uint16_t window_covering_endpoint_id = 0;
 
 ButtonDriver buttonDriver;
 BlindController blindController; //TODO multiple instances when required
@@ -55,6 +56,44 @@ using namespace esp_matter::endpoint;
 using namespace chip::app::Clusters;
 
 constexpr auto k_timeout_seconds = 300;
+
+// Bridges Matter WindowCovering cluster commands to BlindController.
+class BlindWindowCoveringDelegate : public WindowCovering::WindowCoveringDelegate
+{
+public:
+    CHIP_ERROR HandleMovement(WindowCovering::WindowCoveringType type) override
+    {
+        attribute_t *target_attribute = attribute::get(window_covering_endpoint_id, WindowCovering::Id,
+                                                        WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id);
+        esp_matter_attr_val_t target_val = esp_matter_invalid(nullptr);
+        attribute::get_val(target_attribute, &target_val);
+
+        blindController.moveTo(static_cast<uint8_t>(target_val.val.u16 / 100));
+
+        return CHIP_NO_ERROR;
+    }
+
+    CHIP_ERROR HandleStopMotion() override
+    {
+        blindController.stop();
+
+        uint8_t percentage = blindController.getPositionPercentage();
+        esp_matter_attr_val_t position_100ths = esp_matter_uint16(static_cast<uint16_t>(percentage) * 100);
+        attribute::update(window_covering_endpoint_id, WindowCovering::Id,
+                          WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id, &position_100ths);
+        attribute::update(window_covering_endpoint_id, WindowCovering::Id,
+                          WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id, &position_100ths);
+
+        // Kept in sync for clients (e.g. Home Assistant) that only read the legacy percentage attribute.
+        esp_matter_attr_val_t position_percentage = esp_matter_uint8(percentage);
+        attribute::update(window_covering_endpoint_id, WindowCovering::Id,
+                          WindowCovering::Attributes::CurrentPositionLiftPercentage::Id, &position_percentage);
+
+        return CHIP_NO_ERROR;
+    }
+};
+
+static BlindWindowCoveringDelegate windowCoveringDelegate;
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 extern const uint8_t cd_start[] asm("_binary_certification_declaration_der_start");
@@ -186,29 +225,36 @@ extern "C" void app_main()
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
     ABORT_APP_ON_FAILURE(node != nullptr, ESP_LOGE(TAG, "Failed to create Matter node"));
 
-    extended_color_light::config_t light_config;
-    light_config.on_off_lighting.start_up_on_off = nullptr;
-    light_config.color_control.color_mode = (uint8_t)ColorControl::ColorMode::kColorTemperature;
-    light_config.color_control.enhanced_color_mode = (uint8_t)ColorControl::ColorMode::kColorTemperature;
-    light_config.color_control_color_temperature.start_up_color_temperature_mireds = nullptr;
+    window_covering::config_t window_covering_config;
+    window_covering_config.window_covering.type = (uint8_t)WindowCovering::Type::kRollerShadeExterior;
+    window_covering_config.window_covering.feature_flags = cluster::window_covering::feature::lift::get_id() |
+                                                            cluster::window_covering::feature::position_aware_lift::get_id();
+    // Nullable positions default to null; Home Assistant's discovery skips creating the cover entity
+    // entirely if CurrentPositionLiftPercent100ths reads as null, so give it a concrete starting value.
+    window_covering_config.window_covering.features.position_aware_lift.current_position_lift_percent_100ths = nullable<uint16_t>(0);
+    window_covering_config.window_covering.features.position_aware_lift.target_position_lift_percent_100ths = nullable<uint16_t>(0);
+    // Operational + Online. The LiftPositionAware bit is OR'd in automatically when the feature is added below.
+    window_covering_config.window_covering.config_status = (uint8_t)WindowCovering::ConfigStatus::kOperational |
+                                                            (uint8_t)WindowCovering::ConfigStatus::kOnlineReserved;
+    window_covering_config.window_covering.delegate = &windowCoveringDelegate;
 
     // endpoint handles can be used to add/modify clusters.
-    endpoint_t *endpoint = extended_color_light::create(node, &light_config, ENDPOINT_FLAG_NONE, nullptr);
-    ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create extended color light endpoint"));
+    endpoint_t *endpoint = window_covering::create(node, &window_covering_config, ENDPOINT_FLAG_NONE, nullptr);
+    ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create window covering endpoint"));
 
-    light_endpoint_id = endpoint::get_id(endpoint);
-    ESP_LOGI(TAG, "Light created with endpoint_id %d", light_endpoint_id);
+    window_covering_endpoint_id = endpoint::get_id(endpoint);
+    ESP_LOGI(TAG, "Window covering created with endpoint_id %d", window_covering_endpoint_id);
 
-    /* Mark deferred persistence for some attributes that might be changed rapidly */
-    attribute_t *current_level_attribute = attribute::get(light_endpoint_id, LevelControl::Id, LevelControl::Attributes::CurrentLevel::Id);
-    attribute::set_deferred_persistence(current_level_attribute);
+    windowCoveringDelegate.SetEndpoint(window_covering_endpoint_id);
 
-    attribute_t *current_x_attribute = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentX::Id);
-    attribute::set_deferred_persistence(current_x_attribute);
-    attribute_t *current_y_attribute = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::CurrentY::Id);
-    attribute::set_deferred_persistence(current_y_attribute);
-    attribute_t *color_temp_attribute = attribute::get(light_endpoint_id, ColorControl::Id, ColorControl::Attributes::ColorTemperatureMireds::Id);
-    attribute::set_deferred_persistence(color_temp_attribute);
+    // Home Assistant's cover platform keys off this legacy attribute; esp-matter does not add it automatically.
+    cluster_t *window_covering_cluster = cluster::get(endpoint, WindowCovering::Id);
+    cluster::window_covering::attribute::create_current_position_lift_percentage(window_covering_cluster, nullable<uint8_t>(0));
+
+    /* Mark deferred persistence for the position attribute since it changes rapidly while moving */
+    attribute_t *current_position_attribute = attribute::get(window_covering_endpoint_id, WindowCovering::Id,
+                                                              WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id);
+    attribute::set_deferred_persistence(current_position_attribute);
 
     // Initialize drivers
     buttonDriver.init();
