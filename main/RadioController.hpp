@@ -7,16 +7,17 @@
 class RadioController
 {
     static constexpr char *TAG = "RadioController";
+    static constexpr uint32_t REMOTE_ID = 0x9a66ab;
 public:
     enum class Command
     {
         UP = 1,
-        DOWN = 2,
-        STOP = 3
+        DOWN = 3,
+        STOP = 5
     };
 
     void init(SX1276Driver& sx1276Driver);
-    void sendCommand(uint8_t blind, Command command);
+    void sendCommand(uint8_t channel, Command command);
 private:
     SX1276Driver* driver = nullptr;
 };
