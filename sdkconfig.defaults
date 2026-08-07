@@ -31,6 +31,10 @@ CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=2
 CONFIG_BUTTON_PERIOD_TIME_MS=20
 CONFIG_BUTTON_LONG_PRESS_TIME_MS=5000
 
+# SX1276Driver only uses spi_device_polling_transmit (no ISR-driven transfers), so keep the SPI
+# master ISR out of the scarce internal IRAM region to avoid overflowing iram0_0_seg.
+CONFIG_SPI_MASTER_ISR_IN_IRAM=n
+
 # disable softap by default
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
 
