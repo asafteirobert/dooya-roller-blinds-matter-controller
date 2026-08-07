@@ -29,9 +29,9 @@ public:
     bool isMoving() const;
 
     // Time it takes to go from fully open to fully closed
-    uint8_t BLIND_LOWER_TIME_SECONDS = 20;
+    uint8_t BLIND_LOWER_TIME_SECONDS = 24;
     // Time it takes to go from fully closed to fully open
-    uint8_t BLIND_RISE_TIME_SECONDS = 30;
+    uint8_t BLIND_RISE_TIME_SECONDS = 25;
 private:
     enum class Direction
     {
