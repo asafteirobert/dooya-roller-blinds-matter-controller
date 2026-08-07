@@ -12,7 +12,8 @@ void RadioController::sendCommand(uint8_t channel, Command command)
     ESP_LOGI(TAG, "Received command %d for channel %d", static_cast<int>(command), channel);
 
     uint8_t button = static_cast<uint8_t>(command) & 0x0F;
-    uint8_t check = (~button) & 0x0F;
+    //uint8_t check = (~button) & 0x0F;
+    uint8_t check = button;
 
     std::array<uint8_t, 5> data = {
         static_cast<uint8_t>((REMOTE_ID >> 16) & 0xFF),
