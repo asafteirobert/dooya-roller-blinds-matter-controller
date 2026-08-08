@@ -204,8 +204,18 @@ void BlindController::onTravelComplete()
         currentPercentage = targetPercentage;
         direction = Direction::NONE;
 
-        ESP_LOGI(TAG, "Blind %d: reached target %d%%, stopping", blindId, currentPercentage);
-        radioController->sendCommand(blindId, RadioController::Command::STOP);
+        // At the fully open/closed ends the motor has its own limit switch, so let it run
+        // there and self-stop instead of sending STOP. This clears any position estimate
+        // error that may have accumulated from prior moves.
+        if (currentPercentage == 0 || currentPercentage == 100)
+        {
+            ESP_LOGI(TAG, "Blind %d: reached end position %d%%, letting motor self-stop", blindId, currentPercentage);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Blind %d: reached target %d%%, stopping", blindId, currentPercentage);
+            radioController->sendCommand(blindId, RadioController::Command::STOP);
+        }
     }
 
     uint8_t percentageToReport = currentPercentage;
