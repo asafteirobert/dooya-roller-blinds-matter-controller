@@ -274,11 +274,18 @@ extern "C" void app_main()
                                                               WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id);
     attribute::set_deferred_persistence(current_position_attribute);
 
+    // This attribute is nonvolatile, so attribute::create() above already restored it from NVS
+    // (falling back to the 0 default on first-ever boot). Read it back so BlindController starts
+    // from the real last-known position instead of assuming fully open after a reset.
+    esp_matter_attr_val_t restored_position_100ths = esp_matter_invalid(nullptr);
+    attribute::get_val(current_position_attribute, &restored_position_100ths);
+    uint8_t restored_percentage = static_cast<uint8_t>(restored_position_100ths.val.u16 / 100);
+
     // Initialize drivers
     buttonDriver.init();
     sx1276Driver.init();
     radioController.init(sx1276Driver);
-    blindController.init(radioController, 1, onBlindPositionChanged);
+    blindController.init(radioController, 1, onBlindPositionChanged, restored_percentage);
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
     auto * dac_provider = get_dac_provider();

@@ -17,12 +17,17 @@ BlindController::~BlindController()
     }
 }
 
-void BlindController::init(RadioController &radioController, uint8_t blindId, PositionChangedCallback onPositionChanged)
+void BlindController::init(RadioController &radioController, uint8_t blindId, PositionChangedCallback onPositionChanged,
+                            uint8_t initialPercentage)
 {
     this->radioController = &radioController;
     this->blindId = blindId;
     this->onPositionChanged = std::move(onPositionChanged);
     this->mutex = xSemaphoreCreateMutex();
+
+    // Restore the position estimate persisted from before a reset, instead of assuming fully open.
+    this->currentPercentage = initialPercentage;
+    this->targetPercentage = initialPercentage;
 
     const esp_timer_create_args_t timerArgs = {
         .callback = &BlindController::stopTimerCallback,

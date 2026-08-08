@@ -22,7 +22,8 @@ public:
 
     ~BlindController();
 
-    void init(RadioController& radioController, uint8_t blindId, PositionChangedCallback onPositionChanged = nullptr);
+    void init(RadioController& radioController, uint8_t blindId, PositionChangedCallback onPositionChanged = nullptr,
+              uint8_t initialPercentage = 0);
     void moveTo(uint8_t targetPercentage);
     void stop();
     uint8_t getPositionPercentage() const;
