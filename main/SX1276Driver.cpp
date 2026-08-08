@@ -44,6 +44,14 @@ constexpr uint8_t FIFO_THRESHOLD = FIFO_CAPACITY - FIFO_CHUNK; // leaves exactly
 
 constexpr int64_t FIFO_WAIT_TIMEOUT_US = 500000; // generous vs. the ~60-90 ms a real transfer takes
 
+// Deep enough to absorb a burst of UI/Matter-driven commands without send() ever blocking on air time.
+constexpr UBaseType_t COMMAND_QUEUE_LENGTH = 16;
+constexpr uint32_t SENDER_TASK_STACK_WORDS = 4096;
+constexpr UBaseType_t SENDER_TASK_PRIORITY = 5;
+
+// Minimum gap between the end of one queued command and the start of the next
+constexpr uint32_t COMMAND_GAP_MS = 200;
+
 // --- SX1276 FSK/OOK register map (see RFM9x/SX1276 datasheet section 6.2) ---
 constexpr uint8_t REG_FIFO = 0x00;
 constexpr uint8_t REG_OP_MODE = 0x01;
@@ -267,6 +275,26 @@ void SX1276Driver::init()
 
     configureRadio();
     ESP_LOGI(TAG, "SX1276 initialised");
+
+    commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(QueuedCommand));
+    xTaskCreate(&SX1276Driver::senderTask, "sx1276_sender", SENDER_TASK_STACK_WORDS, this, SENDER_TASK_PRIORITY,
+                &senderTaskHandle);
+}
+
+// Runs on a dedicated task for the driver's lifetime, transmitting queued commands strictly in
+// submission order so callers never wait on air time.
+void SX1276Driver::senderTask(void* arg)
+{
+    auto* self = static_cast<SX1276Driver*>(arg);
+    QueuedCommand command;
+    while (true)
+    {
+        if (xQueueReceive(self->commandQueue, &command, portMAX_DELAY) == pdTRUE)
+        {
+            self->sendNow(command.data, command.repeats);
+            vTaskDelay(pdMS_TO_TICKS(COMMAND_GAP_MS));
+        }
+    }
 }
 
 void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
@@ -323,14 +351,26 @@ void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
 
 void SX1276Driver::send(const std::array<uint8_t, 5>& data, uint8_t repeats)
 {
-    ESP_LOGI(TAG, "Sending %02X %02X %02X %02X %02X, repeats=%d",
-             data[0], data[1], data[2], data[3], data[4], repeats);
-
-    if (spiDevice == nullptr)
+    if (commandQueue == nullptr)
     {
         ESP_LOGE(TAG, "SX1276 not initialised, dropping command");
         return;
     }
+
+    QueuedCommand command{ data, repeats };
+    if (xQueueSend(commandQueue, &command, 0) != pdTRUE)
+    {
+        ESP_LOGE(TAG, "SX1276 command queue full, dropping command %02X %02X %02X %02X %02X",
+                 data[0], data[1], data[2], data[3], data[4]);
+    }
+}
+
+// Runs on senderTask. Actually keys the radio and streams the waveform out over SPI; blocks for
+// the duration of the transmission (including inter-repeat gaps).
+void SX1276Driver::sendNow(const std::array<uint8_t, 5>& data, uint8_t repeats)
+{
+    ESP_LOGI(TAG, "Sending %02X %02X %02X %02X %02X, repeats=%d",
+             data[0], data[1], data[2], data[3], data[4], repeats);
 
     std::vector<uint8_t> waveform = buildWaveform(data);
 
