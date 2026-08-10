@@ -173,7 +173,7 @@ void SX1276Driver::writeRegister(uint8_t address, uint8_t value)
     spi_transaction_t transaction = {};
     transaction.length = 8 * sizeof(buffer);
     transaction.tx_buffer = buffer;
-    spi_device_polling_transmit(spiDevice, &transaction);
+    spi_device_polling_transmit(this->spiDevice, &transaction);
 }
 
 uint8_t SX1276Driver::readRegister(uint8_t address)
@@ -184,7 +184,7 @@ uint8_t SX1276Driver::readRegister(uint8_t address)
     transaction.length = 8 * sizeof(tx);
     transaction.tx_buffer = tx;
     transaction.rx_buffer = rx;
-    spi_device_polling_transmit(spiDevice, &transaction);
+    spi_device_polling_transmit(this->spiDevice, &transaction);
     return rx[1];
 }
 
@@ -197,7 +197,7 @@ void SX1276Driver::writeFifo(const uint8_t* data, size_t length)
     spi_transaction_t transaction = {};
     transaction.length = 8 * (length + 1);
     transaction.tx_buffer = buffer;
-    spi_device_polling_transmit(spiDevice, &transaction);
+    spi_device_polling_transmit(this->spiDevice, &transaction);
 }
 
 void SX1276Driver::configureRadio()
@@ -257,7 +257,7 @@ void SX1276Driver::init()
     devConfig.mode = 0; // CPOL=0, CPHA=0
     devConfig.spics_io_num = SX1276_NSS_GPIO;
     devConfig.queue_size = 1;
-    err = spi_bus_add_device(VSPI_HOST, &devConfig, &spiDevice);
+    err = spi_bus_add_device(VSPI_HOST, &devConfig, &this->spiDevice);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to add SX1276 as a SPI device: %d", err);
@@ -269,16 +269,16 @@ void SX1276Driver::init()
     if (version == 0x00 || version == 0xFF)
     {
         ESP_LOGE(TAG, "SX1276 not responding on SPI, aborting init");
-        spiDevice = nullptr;
+        this->spiDevice = nullptr;
         return;
     }
 
     configureRadio();
     ESP_LOGI(TAG, "SX1276 initialised");
 
-    commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(QueuedCommand));
+    this->commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(QueuedCommand));
     xTaskCreate(&SX1276Driver::senderTask, "sx1276_sender", SENDER_TASK_STACK_WORDS, this, SENDER_TASK_PRIORITY,
-                &senderTaskHandle);
+                &this->senderTaskHandle);
 }
 
 // Runs on a dedicated task for the driver's lifetime, transmitting queued commands strictly in
@@ -351,14 +351,14 @@ void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
 
 void SX1276Driver::send(const std::array<uint8_t, 5>& data, uint8_t repeats)
 {
-    if (commandQueue == nullptr)
+    if (this->commandQueue == nullptr)
     {
         ESP_LOGE(TAG, "SX1276 not initialised, dropping command");
         return;
     }
 
     QueuedCommand command{ data, repeats };
-    if (xQueueSend(commandQueue, &command, 0) != pdTRUE)
+    if (xQueueSend(this->commandQueue, &command, 0) != pdTRUE)
     {
         ESP_LOGE(TAG, "SX1276 command queue full, dropping command %02X %02X %02X %02X %02X",
                  data[0], data[1], data[2], data[3], data[4]);

@@ -48,8 +48,8 @@ static const char *TAG = "app_main";
 // Maximum number of blinds this firmware can be configured to control. Bounds the NumBlinds
 // attribute (see SystemConfig below) and sizes the per-blind static arrays below (this codebase
 // does no heap allocation, so the arrays are sized to the hard max and only the first
-// g_num_blinds entries are ever used).
-constexpr uint8_t kMaxBlinds = 8;
+// numBlinds entries are ever used).
+constexpr uint8_t MAX_BLINDS = 8;
 
 ButtonDriver buttonDriver;
 RadioController radioController;
@@ -58,17 +58,17 @@ SX1276Driver sx1276Driver;
 // One BlindController per configured blind. RadioController/SX1276Driver stay singletons: they
 // are the shared radio, addressed per-command by remoteId+channel, so only per-blind motion
 // state needs multiple instances.
-BlindController blindControllers[kMaxBlinds];
+BlindController blindControllers[MAX_BLINDS];
 // 0 is the root endpoint id, never a blind's, so it doubles as the "unused slot" sentinel here.
-uint16_t window_covering_endpoint_ids[kMaxBlinds] = {0};
-uint8_t g_num_blinds = 1;
+uint16_t windowCoveringEndpointIds[MAX_BLINDS] = {0};
+uint8_t numBlinds = 1;
 
 using namespace esp_matter;
 using namespace esp_matter::attribute;
 using namespace esp_matter::endpoint;
 using namespace chip::app::Clusters;
 
-constexpr auto k_timeout_seconds = 300;
+constexpr auto TIMEOUT_SECONDS = 300;
 
 // Manufacturer-specific cluster exposing BlindController's per-installation settings (travel
 // timings, RF channel, remote ID), so they can be tuned over Matter instead of being
@@ -80,19 +80,19 @@ namespace BlindConfig
 {
 // CONFIG_DEVICE_VENDOR_ID (0xFFF1) is the Matter test vendor ID this build already uses;
 // FC00 is the first cluster ID in the manufacturer-specific range.
-constexpr uint32_t kClusterId = 0xFFF1FC00;
-constexpr uint32_t kLowerTimeAttributeId = 0x0000;
-constexpr uint32_t kRiseTimeAttributeId = 0x0001;
-constexpr uint32_t kChannelAttributeId = 0x0002;
-constexpr uint32_t kRemoteIdAttributeId = 0x0003;
-constexpr uint32_t kMinTravelTimeMs = 1000;
-constexpr uint32_t kMaxTravelTimeMs = 120000;
+constexpr uint32_t CLUSTER_ID = 0xFFF1FC00;
+constexpr uint32_t LOWER_TIME_ATTRIBUTE_ID = 0x0000;
+constexpr uint32_t RISE_TIME_ATTRIBUTE_ID = 0x0001;
+constexpr uint32_t CHANNEL_ATTRIBUTE_ID = 0x0002;
+constexpr uint32_t REMOTE_ID_ATTRIBUTE_ID = 0x0003;
+constexpr uint32_t MIN_TRAVEL_TIME_MS = 1000;
+constexpr uint32_t MAX_TRAVEL_TIME_MS = 120000;
 // Dooya remotes commonly address channels 0-15 (0 often used as an "all channels" group).
-constexpr uint8_t kMinChannel = 0;
-constexpr uint8_t kMaxChannel = 15;
+constexpr uint8_t MIN_CHANNEL = 0;
+constexpr uint8_t MAX_CHANNEL = 15;
 // The remote ID occupies 3 bytes of the RF packet (see RadioController::sendCommand), so it
 // is a 24-bit value.
-constexpr uint32_t kMaxRemoteId = 0xFFFFFF;
+constexpr uint32_t MAX_REMOTE_ID = 0xFFFFFF;
 } // namespace BlindConfig
 
 // Manufacturer-specific cluster on the root endpoint (endpoint 0) exposing how many blind
@@ -102,26 +102,26 @@ constexpr uint32_t kMaxRemoteId = 0xFFFFFF;
 // is normally discovered (via the Descriptor cluster's PartsList), not commanded.
 namespace SystemConfig
 {
-constexpr uint32_t kClusterId = 0xFFF1FC01;
-constexpr uint32_t kNumBlindsAttributeId = 0x0000;
-constexpr uint8_t kMinBlinds = 1;
-constexpr uint8_t kMaxBlinds = ::kMaxBlinds;
+constexpr uint32_t CLUSTER_ID = 0xFFF1FC01;
+constexpr uint32_t NUM_BLINDS_ATTRIBUTE_ID = 0x0000;
+constexpr uint8_t MIN_BLINDS = 1;
+constexpr uint8_t MAX_BLINDS = ::MAX_BLINDS;
 } // namespace SystemConfig
 
 // Bridges Matter WindowCovering cluster commands to this instance's BlindController.
 class BlindWindowCoveringDelegate : public WindowCovering::WindowCoveringDelegate
 {
 public:
-    void SetBlindController(BlindController *blindController) { controller = blindController; }
+    void SetBlindController(BlindController *blindController) { this->controller = blindController; }
 
     CHIP_ERROR HandleMovement(WindowCovering::WindowCoveringType type) override
     {
-        attribute_t *target_attribute = attribute::get(mEndpoint, WindowCovering::Id,
+        attribute_t *target_attribute = attribute::get(this->mEndpoint, WindowCovering::Id,
                                                         WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id);
         esp_matter_attr_val_t target_val = esp_matter_invalid(nullptr);
         attribute::get_val(target_attribute, &target_val);
 
-        controller->moveTo(static_cast<uint8_t>(target_val.val.u16 / 100));
+        this->controller->moveTo(static_cast<uint8_t>(target_val.val.u16 / 100));
 
         return CHIP_NO_ERROR;
     }
@@ -129,14 +129,14 @@ public:
     CHIP_ERROR HandleStopMotion() override
     {
         // Triggers the position-changed callback with the resting position, syncing the Current* attributes.
-        controller->stop();
+        this->controller->stop();
 
         // Per the Matter spec, Stop cancels any pending motion, so Target should collapse to Current.
         // TargetPositionLiftPercent100ths is a nullable attribute, so it must be updated with a
         // nullable value or esp_matter rejects the write with ESP_ERR_INVALID_ARG.
-        uint8_t percentage = controller->getPositionPercentage();
+        uint8_t percentage = this->controller->getPositionPercentage();
         esp_matter_attr_val_t position_100ths = esp_matter_nullable_uint16(nullable<uint16_t>(static_cast<uint16_t>(percentage) * 100));
-        attribute::update(mEndpoint, WindowCovering::Id,
+        attribute::update(this->mEndpoint, WindowCovering::Id,
                           WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id, &position_100ths);
 
         return CHIP_NO_ERROR;
@@ -146,7 +146,7 @@ private:
     BlindController *controller = nullptr;
 };
 
-static BlindWindowCoveringDelegate windowCoveringDelegates[kMaxBlinds];
+static BlindWindowCoveringDelegate windowCoveringDelegates[MAX_BLINDS];
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 extern const uint8_t cd_start[] asm("_binary_certification_declaration_der_start");
@@ -159,8 +159,8 @@ const chip::ByteSpan cdSpan(cd_start, static_cast<size_t>(cd_end - cd_start));
 extern const char decryption_key_start[] asm("_binary_esp_image_encryption_key_pem_start");
 extern const char decryption_key_end[] asm("_binary_esp_image_encryption_key_pem_end");
 
-static const char *s_decryption_key = decryption_key_start;
-static const uint16_t s_decryption_key_len = decryption_key_end - decryption_key_start;
+static const char *DECRYPTION_KEY = decryption_key_start;
+static const uint16_t DECRYPTION_KEY_LEN = decryption_key_end - decryption_key_start;
 #endif // CONFIG_ENABLE_ENCRYPTED_OTA
 
 static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
@@ -200,13 +200,13 @@ static void app_event_cb(const ChipDeviceEvent *event, intptr_t arg)
         ESP_LOGI(TAG, "Fabric removed successfully");
         if (chip::Server::GetInstance().GetFabricTable().FabricCount() == 0) {
             chip::CommissioningWindowManager  &commissionMgr = chip::Server::GetInstance().GetCommissioningWindowManager();
-            constexpr auto kTimeoutSeconds = chip::System::Clock::Seconds16(k_timeout_seconds);
-            if (!commissionMgr.IsCommissioningWindowOpen()) 
+            constexpr auto COMMISSIONING_WINDOW_TIMEOUT = chip::System::Clock::Seconds16(TIMEOUT_SECONDS);
+            if (!commissionMgr.IsCommissioningWindowOpen())
             {
                 /* After removing last fabric, this example does not remove the Wi-Fi credentials
                  * and still has IP connectivity so, only advertising on DNS-SD.
                  */
-                CHIP_ERROR err = commissionMgr.OpenBasicCommissioningWindow(kTimeoutSeconds,
+                CHIP_ERROR err = commissionMgr.OpenBasicCommissioningWindow(COMMISSIONING_WINDOW_TIMEOUT,
                                                                             chip::CommissioningWindowAdvertisement::kDnssdOnly);
                 if (err != CHIP_NO_ERROR) 
                 {
@@ -247,13 +247,13 @@ static esp_err_t app_identification_cb(identification::callback_type_t type, uin
     return ESP_OK;
 }
 
-// Finds which blind (if any) an endpoint id belongs to. Linear scan is fine: at most kMaxBlinds
+// Finds which blind (if any) an endpoint id belongs to. Linear scan is fine: at most MAX_BLINDS
 // (8) entries.
 static BlindController *find_blind_controller(uint16_t endpoint_id)
 {
-    for (uint8_t i = 0; i < g_num_blinds; ++i)
+    for (uint8_t i = 0; i < numBlinds; ++i)
     {
-        if (window_covering_endpoint_ids[i] == endpoint_id)
+        if (windowCoveringEndpointIds[i] == endpoint_id)
         {
             return &blindControllers[i];
         }
@@ -296,24 +296,24 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 
     if (type == PRE_UPDATE)
     {
-        if (cluster_id == BlindConfig::kClusterId)
+        if (cluster_id == BlindConfig::CLUSTER_ID)
         {
             BlindController *controller = find_blind_controller(endpoint_id);
             if (controller != nullptr)
             {
-                if (attribute_id == BlindConfig::kLowerTimeAttributeId)
+                if (attribute_id == BlindConfig::LOWER_TIME_ATTRIBUTE_ID)
                 {
                     controller->blindLowerTimeMs = val->val.u32;
                 }
-                else if (attribute_id == BlindConfig::kRiseTimeAttributeId)
+                else if (attribute_id == BlindConfig::RISE_TIME_ATTRIBUTE_ID)
                 {
                     controller->blindRiseTimeMs = val->val.u32;
                 }
-                else if (attribute_id == BlindConfig::kChannelAttributeId)
+                else if (attribute_id == BlindConfig::CHANNEL_ATTRIBUTE_ID)
                 {
                     controller->blindRadioChannel = val->val.u8;
                 }
-                else if (attribute_id == BlindConfig::kRemoteIdAttributeId)
+                else if (attribute_id == BlindConfig::REMOTE_ID_ATTRIBUTE_ID)
                 {
                     controller->blindRemoteId = val->val.u32;
                 }
@@ -322,7 +322,7 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     }
     else if (type == POST_UPDATE)
     {
-        if (cluster_id == SystemConfig::kClusterId && attribute_id == SystemConfig::kNumBlindsAttributeId)
+        if (cluster_id == SystemConfig::CLUSTER_ID && attribute_id == SystemConfig::NUM_BLINDS_ATTRIBUTE_ID)
         {
             schedule_reboot();
         }
@@ -351,14 +351,14 @@ extern "C" void app_main()
     endpoint_t *root_endpoint = endpoint::get(node, 0);
     ABORT_APP_ON_FAILURE(root_endpoint != nullptr, ESP_LOGE(TAG, "Failed to get root endpoint"));
 
-    cluster_t *system_config_cluster = cluster::create(root_endpoint, SystemConfig::kClusterId, CLUSTER_FLAG_SERVER);
+    cluster_t *system_config_cluster = cluster::create(root_endpoint, SystemConfig::CLUSTER_ID, CLUSTER_FLAG_SERVER);
     ABORT_APP_ON_FAILURE(system_config_cluster != nullptr, ESP_LOGE(TAG, "Failed to create system config cluster"));
 
-    attribute_t *num_blinds_attribute = attribute::create(system_config_cluster, SystemConfig::kNumBlindsAttributeId,
+    attribute_t *num_blinds_attribute = attribute::create(system_config_cluster, SystemConfig::NUM_BLINDS_ATTRIBUTE_ID,
                                                            ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
                                                            esp_matter_uint8(1));
-    attribute::add_bounds(num_blinds_attribute, esp_matter_uint8(SystemConfig::kMinBlinds),
-                          esp_matter_uint8(SystemConfig::kMaxBlinds));
+    attribute::add_bounds(num_blinds_attribute, esp_matter_uint8(SystemConfig::MIN_BLINDS),
+                          esp_matter_uint8(SystemConfig::MAX_BLINDS));
 
     // This attribute is nonvolatile, so attribute::create() above already restored any value
     // persisted from before a reset (falling back to the default of 1 on first-ever boot). The
@@ -366,11 +366,11 @@ extern "C" void app_main()
     // firmware downgrade) bypasses that path, so clamp defensively before using it as a loop bound.
     esp_matter_attr_val_t restored_num_blinds = esp_matter_invalid(nullptr);
     attribute::get_val(num_blinds_attribute, &restored_num_blinds);
-    g_num_blinds = restored_num_blinds.val.u8;
-    if (g_num_blinds < SystemConfig::kMinBlinds || g_num_blinds > SystemConfig::kMaxBlinds)
+    numBlinds = restored_num_blinds.val.u8;
+    if (numBlinds < SystemConfig::MIN_BLINDS || numBlinds > SystemConfig::MAX_BLINDS)
     {
-        ESP_LOGW(TAG, "Persisted NumBlinds %u out of range, falling back to 1", g_num_blinds);
-        g_num_blinds = 1;
+        ESP_LOGW(TAG, "Persisted NumBlinds %u out of range, falling back to 1", numBlinds);
+        numBlinds = 1;
     }
 
     // Initialize the shared radio once; each blind's BlindController below gets its own init()
@@ -379,7 +379,7 @@ extern "C" void app_main()
     sx1276Driver.init();
     radioController.init(sx1276Driver);
 
-    for (uint8_t i = 0; i < g_num_blinds; ++i)
+    for (uint8_t i = 0; i < numBlinds; ++i)
     {
         window_covering::config_t window_covering_config;
         window_covering_config.window_covering.type = (uint8_t)WindowCovering::Type::kRollerShadeExterior;
@@ -398,10 +398,10 @@ extern "C" void app_main()
         endpoint_t *endpoint = window_covering::create(node, &window_covering_config, ENDPOINT_FLAG_NONE, nullptr);
         ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create window covering endpoint"));
 
-        window_covering_endpoint_ids[i] = endpoint::get_id(endpoint);
-        ESP_LOGI(TAG, "Window covering %u created with endpoint_id %d", i, window_covering_endpoint_ids[i]);
+        windowCoveringEndpointIds[i] = endpoint::get_id(endpoint);
+        ESP_LOGI(TAG, "Window covering %u created with endpoint_id %d", i, windowCoveringEndpointIds[i]);
 
-        windowCoveringDelegates[i].SetEndpoint(window_covering_endpoint_ids[i]);
+        windowCoveringDelegates[i].SetEndpoint(windowCoveringEndpointIds[i]);
         windowCoveringDelegates[i].SetBlindController(&blindControllers[i]);
 
         // Home Assistant's cover platform keys off this legacy attribute; esp-matter does not add it automatically.
@@ -409,7 +409,7 @@ extern "C" void app_main()
         cluster::window_covering::attribute::create_current_position_lift_percentage(window_covering_cluster, nullable<uint8_t>(0));
 
         /* Mark deferred persistence for the position attribute since it changes rapidly while moving */
-        attribute_t *current_position_attribute = attribute::get(window_covering_endpoint_ids[i], WindowCovering::Id,
+        attribute_t *current_position_attribute = attribute::get(windowCoveringEndpointIds[i], WindowCovering::Id,
                                                                   WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id);
         attribute::set_deferred_persistence(current_position_attribute);
 
@@ -421,35 +421,35 @@ extern "C" void app_main()
         uint8_t restored_percentage = static_cast<uint8_t>(restored_position_100ths.val.u16 / 100);
 
         // Custom cluster exposing the blind's travel timings so they can be tuned over Matter.
-        cluster_t *blind_config_cluster = cluster::create(endpoint, BlindConfig::kClusterId, CLUSTER_FLAG_SERVER);
+        cluster_t *blind_config_cluster = cluster::create(endpoint, BlindConfig::CLUSTER_ID, CLUSTER_FLAG_SERVER);
         ABORT_APP_ON_FAILURE(blind_config_cluster != nullptr, ESP_LOGE(TAG, "Failed to create blind config cluster"));
 
-        attribute_t *lower_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kLowerTimeAttributeId,
+        attribute_t *lower_time_attribute = attribute::create(blind_config_cluster, BlindConfig::LOWER_TIME_ATTRIBUTE_ID,
                                                                ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
                                                                esp_matter_uint32(blindControllers[i].blindLowerTimeMs));
-        attribute::add_bounds(lower_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
-                              esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+        attribute::add_bounds(lower_time_attribute, esp_matter_uint32(BlindConfig::MIN_TRAVEL_TIME_MS),
+                              esp_matter_uint32(BlindConfig::MAX_TRAVEL_TIME_MS));
 
-        attribute_t *rise_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kRiseTimeAttributeId,
+        attribute_t *rise_time_attribute = attribute::create(blind_config_cluster, BlindConfig::RISE_TIME_ATTRIBUTE_ID,
                                                               ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
                                                               esp_matter_uint32(blindControllers[i].blindRiseTimeMs));
-        attribute::add_bounds(rise_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
-                              esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+        attribute::add_bounds(rise_time_attribute, esp_matter_uint32(BlindConfig::MIN_TRAVEL_TIME_MS),
+                              esp_matter_uint32(BlindConfig::MAX_TRAVEL_TIME_MS));
 
         // Fresh-boot default: give each blind a distinct channel (1, 2, 3, ...) instead of every
         // instance defaulting to BlindController's same hardcoded value. A value persisted from
         // before a reset still overrides this via the restored_channel read-back below.
         blindControllers[i].blindRadioChannel = static_cast<uint8_t>(i + 1);
-        attribute_t *channel_attribute = attribute::create(blind_config_cluster, BlindConfig::kChannelAttributeId,
+        attribute_t *channel_attribute = attribute::create(blind_config_cluster, BlindConfig::CHANNEL_ATTRIBUTE_ID,
                                                             ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
                                                             esp_matter_uint8(blindControllers[i].blindRadioChannel));
-        attribute::add_bounds(channel_attribute, esp_matter_uint8(BlindConfig::kMinChannel),
-                              esp_matter_uint8(BlindConfig::kMaxChannel));
+        attribute::add_bounds(channel_attribute, esp_matter_uint8(BlindConfig::MIN_CHANNEL),
+                              esp_matter_uint8(BlindConfig::MAX_CHANNEL));
 
-        attribute_t *remote_id_attribute = attribute::create(blind_config_cluster, BlindConfig::kRemoteIdAttributeId,
+        attribute_t *remote_id_attribute = attribute::create(blind_config_cluster, BlindConfig::REMOTE_ID_ATTRIBUTE_ID,
                                                               ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
                                                               esp_matter_uint32(blindControllers[i].blindRemoteId));
-        attribute::add_bounds(remote_id_attribute, esp_matter_uint32(0), esp_matter_uint32(BlindConfig::kMaxRemoteId));
+        attribute::add_bounds(remote_id_attribute, esp_matter_uint32(0), esp_matter_uint32(BlindConfig::MAX_REMOTE_ID));
 
         // These attributes are nonvolatile, so attribute::create() above already restored any value
         // persisted from before a reset (falling back to the default passed in above on first-ever boot).
@@ -480,7 +480,7 @@ extern "C" void app_main()
         // updated with nullable values or esp_matter rejects the write with ESP_ERR_INVALID_ARG
         // (silently leaving the attribute, and Home Assistant's display, stale). Captures this
         // blind's endpoint id by value since it never changes after creation.
-        uint16_t endpoint_id_for_callback = window_covering_endpoint_ids[i];
+        uint16_t endpoint_id_for_callback = windowCoveringEndpointIds[i];
         blindControllers[i].init(
             radioController,
             [endpoint_id_for_callback](uint8_t percentage)
@@ -512,7 +512,7 @@ extern "C" void app_main()
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to start Matter, err:%d", err));
 
 #if CONFIG_ENABLE_ENCRYPTED_OTA
-    err = esp_matter_ota_requestor_encrypted_init(s_decryption_key, s_decryption_key_len);
+    err = esp_matter_ota_requestor_encrypted_init(DECRYPTION_KEY, DECRYPTION_KEY_LEN);
     ABORT_APP_ON_FAILURE(err == ESP_OK, ESP_LOGE(TAG, "Failed to initialized the encrypted OTA, err: %d", err));
 #endif // CONFIG_ENABLE_ENCRYPTED_OTA
 

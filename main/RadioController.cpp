@@ -23,5 +23,5 @@ void RadioController::sendCommand(uint32_t remoteId, uint8_t channel, Command co
         static_cast<uint8_t>((button << 4) | check),
     };
 
-    driver->send(data, 3);
+    this->driver->send(data, 3);
 }

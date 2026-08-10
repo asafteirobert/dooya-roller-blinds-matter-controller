@@ -6,14 +6,14 @@
 
 BlindController::~BlindController()
 {
-    if (stopTimer != nullptr)
+    if (this->stopTimer != nullptr)
     {
-        esp_timer_stop(stopTimer);
-        esp_timer_delete(stopTimer);
+        esp_timer_stop(this->stopTimer);
+        esp_timer_delete(this->stopTimer);
     }
-    if (mutex != nullptr)
+    if (this->mutex != nullptr)
     {
-        vSemaphoreDelete(mutex);
+        vSemaphoreDelete(this->mutex);
     }
 }
 
@@ -43,45 +43,45 @@ void BlindController::moveTo(uint8_t percentage)
         percentage = 100;
     }
 
-    xSemaphoreTake(mutex, portMAX_DELAY);
+    xSemaphoreTake(this->mutex, portMAX_DELAY);
 
     // A move is already in flight: figure out where the blind actually is before deciding
     // what to do next, and cancel the pending STOP for the old target.
-    if (direction != Direction::NONE)
+    if (this->direction != Direction::NONE)
     {
         cancelStopTimerLocked();
         syncPercentageToElapsedTravelLocked();
     }
 
-    targetPercentage = percentage;
+    this->targetPercentage = percentage;
 
-    if (targetPercentage == currentPercentage)
+    if (this->targetPercentage == this->currentPercentage)
     {
-        if (direction != Direction::NONE)
+        if (this->direction != Direction::NONE)
         {
-            ESP_LOGI(TAG, "Blind %d: new target %d matches current position, stopping", blindRadioChannel, percentage);
-            radioController->sendCommand(blindRemoteId, blindRadioChannel, RadioController::Command::STOP);
+            ESP_LOGI(TAG, "Blind %d: new target %d matches current position, stopping", this->blindRadioChannel, percentage);
+            this->radioController->sendCommand(this->blindRemoteId, this->blindRadioChannel, RadioController::Command::STOP);
         }
-        direction = Direction::NONE;
+        this->direction = Direction::NONE;
     }
     else
     {
-        Direction newDirection = (targetPercentage > currentPercentage) ? Direction::DOWN : Direction::UP;
-        int diff = static_cast<int>(targetPercentage) - static_cast<int>(currentPercentage);
+        Direction newDirection = (this->targetPercentage > this->currentPercentage) ? Direction::DOWN : Direction::UP;
+        int diff = static_cast<int>(this->targetPercentage) - static_cast<int>(this->currentPercentage);
         if (diff < 0)
         {
             diff = -diff;
         }
-        uint32_t travelMiliseconds = (newDirection == Direction::DOWN) ? blindLowerTimeMs : blindRiseTimeMs;
+        uint32_t travelMiliseconds = (newDirection == Direction::DOWN) ? this->blindLowerTimeMs : this->blindRiseTimeMs;
 
-        ESP_LOGI(TAG, "Blind %d: moving from %d to %d (%s)", blindRadioChannel, currentPercentage, targetPercentage,
+        ESP_LOGI(TAG, "Blind %d: moving from %d to %d (%s)", this->blindRadioChannel, this->currentPercentage, this->targetPercentage,
                  newDirection == Direction::DOWN ? "DOWN" : "UP");
 
-        direction = newDirection;
-        moveStartPercentage = currentPercentage;
-        moveStartTimeUs = esp_timer_get_time();
+        this->direction = newDirection;
+        this->moveStartPercentage = this->currentPercentage;
+        this->moveStartTimeUs = esp_timer_get_time();
 
-        radioController->sendCommand(blindRemoteId, blindRadioChannel, newDirection == Direction::DOWN ? RadioController::Command::DOWN
+        this->radioController->sendCommand(this->blindRemoteId, this->blindRadioChannel, newDirection == Direction::DOWN ? RadioController::Command::DOWN
                                                                                : RadioController::Command::UP);
 
         uint64_t travelTimeUs = static_cast<uint64_t>(diff) * travelMiliseconds * 1000ULL / 100;
@@ -89,57 +89,57 @@ void BlindController::moveTo(uint8_t percentage)
         {
             travelTimeUs = 1;
         }
-        esp_timer_start_once(stopTimer, travelTimeUs);
+        esp_timer_start_once(this->stopTimer, travelTimeUs);
     }
 
-    uint8_t percentageToReport = currentPercentage;
-    xSemaphoreGive(mutex);
+    uint8_t percentageToReport = this->currentPercentage;
+    xSemaphoreGive(this->mutex);
 
-    if (onPositionChanged)
+    if (this->onPositionChanged)
     {
-        onPositionChanged(percentageToReport);
+        this->onPositionChanged(percentageToReport);
     }
 }
 
 void BlindController::stop()
 {
-    xSemaphoreTake(mutex, portMAX_DELAY);
+    xSemaphoreTake(this->mutex, portMAX_DELAY);
 
-    bool wasMoving = (direction != Direction::NONE);
+    bool wasMoving = (this->direction != Direction::NONE);
     if (wasMoving)
     {
         cancelStopTimerLocked();
         syncPercentageToElapsedTravelLocked();
 
-        ESP_LOGI(TAG, "Blind %d: stop requested at %d%%", blindRadioChannel, currentPercentage);
-        radioController->sendCommand(blindRemoteId, blindRadioChannel, RadioController::Command::STOP);
+        ESP_LOGI(TAG, "Blind %d: stop requested at %d%%", this->blindRadioChannel, this->currentPercentage);
+        this->radioController->sendCommand(this->blindRemoteId, this->blindRadioChannel, RadioController::Command::STOP);
 
-        direction = Direction::NONE;
-        targetPercentage = currentPercentage;
+        this->direction = Direction::NONE;
+        this->targetPercentage = this->currentPercentage;
     }
 
-    uint8_t percentageToReport = currentPercentage;
-    xSemaphoreGive(mutex);
+    uint8_t percentageToReport = this->currentPercentage;
+    xSemaphoreGive(this->mutex);
 
-    if (wasMoving && onPositionChanged)
+    if (wasMoving && this->onPositionChanged)
     {
-        onPositionChanged(percentageToReport);
+        this->onPositionChanged(percentageToReport);
     }
 }
 
 uint8_t BlindController::getPositionPercentage() const
 {
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    uint8_t percentage = currentPercentage;
-    xSemaphoreGive(mutex);
+    xSemaphoreTake(this->mutex, portMAX_DELAY);
+    uint8_t percentage = this->currentPercentage;
+    xSemaphoreGive(this->mutex);
     return percentage;
 }
 
 bool BlindController::isMoving() const
 {
-    xSemaphoreTake(mutex, portMAX_DELAY);
-    bool moving = (direction != Direction::NONE);
-    xSemaphoreGive(mutex);
+    xSemaphoreTake(this->mutex, portMAX_DELAY);
+    bool moving = (this->direction != Direction::NONE);
+    xSemaphoreGive(this->mutex);
     return moving;
 }
 
@@ -147,43 +147,43 @@ bool BlindController::isMoving() const
 // move started and folds that into currentPercentage, without touching the radio or the timer.
 void BlindController::syncPercentageToElapsedTravelLocked()
 {
-    if (direction == Direction::NONE)
+    if (this->direction == Direction::NONE)
     {
         return;
     }
 
-    int totalDiff = static_cast<int>(targetPercentage) - static_cast<int>(moveStartPercentage);
+    int totalDiff = static_cast<int>(this->targetPercentage) - static_cast<int>(this->moveStartPercentage);
     if (totalDiff < 0)
     {
         totalDiff = -totalDiff;
     }
 
-    uint32_t travelMiliseconds = (direction == Direction::DOWN) ? blindLowerTimeMs : blindRiseTimeMs;
+    uint32_t travelMiliseconds = (this->direction == Direction::DOWN) ? this->blindLowerTimeMs : this->blindRiseTimeMs;
     if (totalDiff == 0 || travelMiliseconds == 0)
     {
-        currentPercentage = targetPercentage;
+        this->currentPercentage = this->targetPercentage;
         return;
     }
 
     int64_t totalTravelUs = static_cast<int64_t>(totalDiff) * travelMiliseconds * 1000000LL / 100;
-    int64_t elapsedUs = esp_timer_get_time() - moveStartTimeUs;
+    int64_t elapsedUs = esp_timer_get_time() - this->moveStartTimeUs;
     if (elapsedUs >= totalTravelUs)
     {
-        currentPercentage = targetPercentage;
+        this->currentPercentage = this->targetPercentage;
         return;
     }
 
     int percentTravelled = static_cast<int>(elapsedUs * totalDiff / totalTravelUs);
-    currentPercentage = (direction == Direction::DOWN) ? static_cast<uint8_t>(moveStartPercentage + percentTravelled)
-                                                        : static_cast<uint8_t>(moveStartPercentage - percentTravelled);
+    this->currentPercentage = (this->direction == Direction::DOWN) ? static_cast<uint8_t>(this->moveStartPercentage + percentTravelled)
+                                                        : static_cast<uint8_t>(this->moveStartPercentage - percentTravelled);
 }
 
 // Called with the mutex held.
 void BlindController::cancelStopTimerLocked()
 {
-    if (esp_timer_is_active(stopTimer))
+    if (esp_timer_is_active(this->stopTimer))
     {
-        esp_timer_stop(stopTimer);
+        esp_timer_stop(this->stopTimer);
     }
 }
 
@@ -195,33 +195,33 @@ void BlindController::stopTimerCallback(void *arg)
 // Runs on the esp_timer service task once the computed travel time has elapsed.
 void BlindController::onTravelComplete()
 {
-    xSemaphoreTake(mutex, portMAX_DELAY);
+    xSemaphoreTake(this->mutex, portMAX_DELAY);
 
-    bool wasMoving = (direction != Direction::NONE);
+    bool wasMoving = (this->direction != Direction::NONE);
     if (wasMoving)
     {
-        currentPercentage = targetPercentage;
-        direction = Direction::NONE;
+        this->currentPercentage = this->targetPercentage;
+        this->direction = Direction::NONE;
 
         // At the fully open/closed ends the motor has its own limit switch, so let it run
         // there and self-stop instead of sending STOP. This clears any position estimate
         // error that may have accumulated from prior moves.
-        if (currentPercentage == 0 || currentPercentage == 100)
+        if (this->currentPercentage == 0 || this->currentPercentage == 100)
         {
-            ESP_LOGI(TAG, "Blind %d: reached end position %d%%, letting motor self-stop", blindRadioChannel, currentPercentage);
+            ESP_LOGI(TAG, "Blind %d: reached end position %d%%, letting motor self-stop", this->blindRadioChannel, this->currentPercentage);
         }
         else
         {
-            ESP_LOGI(TAG, "Blind %d: reached target %d%%, stopping", blindRadioChannel, currentPercentage);
-            radioController->sendCommand(blindRemoteId, blindRadioChannel, RadioController::Command::STOP);
+            ESP_LOGI(TAG, "Blind %d: reached target %d%%, stopping", this->blindRadioChannel, this->currentPercentage);
+            this->radioController->sendCommand(this->blindRemoteId, this->blindRadioChannel, RadioController::Command::STOP);
         }
     }
 
-    uint8_t percentageToReport = currentPercentage;
-    xSemaphoreGive(mutex);
+    uint8_t percentageToReport = this->currentPercentage;
+    xSemaphoreGive(this->mutex);
 
-    if (wasMoving && onPositionChanged)
+    if (wasMoving && this->onPositionChanged)
     {
-        onPositionChanged(percentageToReport);
+        this->onPositionChanged(percentageToReport);
     }
 }
