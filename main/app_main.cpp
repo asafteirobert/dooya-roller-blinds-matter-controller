@@ -9,6 +9,7 @@
 #include <esp_err.h>
 #include <esp_log.h>
 #include <esp_mac.h>
+#include <esp_timer.h>
 #include <nvs_flash.h>
 
 #include <esp_matter.h>
@@ -43,12 +44,24 @@ using namespace chip::DeviceLayer;
 #endif
 
 static const char *TAG = "app_main";
-uint16_t window_covering_endpoint_id = 0;
+
+// Maximum number of blinds this firmware can be configured to control. Bounds the NumBlinds
+// attribute (see SystemConfig below) and sizes the per-blind static arrays below (this codebase
+// does no heap allocation, so the arrays are sized to the hard max and only the first
+// g_num_blinds entries are ever used).
+constexpr uint8_t kMaxBlinds = 8;
 
 ButtonDriver buttonDriver;
-BlindController blindController; //TODO multiple instances when required
 RadioController radioController;
 SX1276Driver sx1276Driver;
+
+// One BlindController per configured blind. RadioController/SX1276Driver stay singletons: they
+// are the shared radio, addressed per-command by remoteId+channel, so only per-blind motion
+// state needs multiple instances.
+BlindController blindControllers[kMaxBlinds];
+// 0 is the root endpoint id, never a blind's, so it doubles as the "unused slot" sentinel here.
+uint16_t window_covering_endpoint_ids[kMaxBlinds] = {0};
+uint8_t g_num_blinds = 1;
 
 using namespace esp_matter;
 using namespace esp_matter::attribute;
@@ -82,61 +95,58 @@ constexpr uint8_t kMaxChannel = 15;
 constexpr uint32_t kMaxRemoteId = 0xFFFFFF;
 } // namespace BlindConfig
 
-// Bridges Matter WindowCovering cluster commands to BlindController.
+// Manufacturer-specific cluster on the root endpoint (endpoint 0) exposing how many blind
+// endpoints to instantiate. Lives on the root endpoint (rather than a blind's own endpoint)
+// because it must be readable before any blind endpoint has been created, since it decides how
+// many of those to create. There is no standard Matter cluster for this: endpoint composition
+// is normally discovered (via the Descriptor cluster's PartsList), not commanded.
+namespace SystemConfig
+{
+constexpr uint32_t kClusterId = 0xFFF1FC01;
+constexpr uint32_t kNumBlindsAttributeId = 0x0000;
+constexpr uint8_t kMinBlinds = 1;
+constexpr uint8_t kMaxBlinds = ::kMaxBlinds;
+} // namespace SystemConfig
+
+// Bridges Matter WindowCovering cluster commands to this instance's BlindController.
 class BlindWindowCoveringDelegate : public WindowCovering::WindowCoveringDelegate
 {
 public:
+    void SetBlindController(BlindController *blindController) { controller = blindController; }
+
     CHIP_ERROR HandleMovement(WindowCovering::WindowCoveringType type) override
     {
-        attribute_t *target_attribute = attribute::get(window_covering_endpoint_id, WindowCovering::Id,
+        attribute_t *target_attribute = attribute::get(mEndpoint, WindowCovering::Id,
                                                         WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id);
         esp_matter_attr_val_t target_val = esp_matter_invalid(nullptr);
         attribute::get_val(target_attribute, &target_val);
 
-        blindController.moveTo(static_cast<uint8_t>(target_val.val.u16 / 100));
+        controller->moveTo(static_cast<uint8_t>(target_val.val.u16 / 100));
 
         return CHIP_NO_ERROR;
     }
 
     CHIP_ERROR HandleStopMotion() override
     {
-        // Triggers onBlindPositionChanged with the resting position, syncing the Current* attributes.
-        blindController.stop();
+        // Triggers the position-changed callback with the resting position, syncing the Current* attributes.
+        controller->stop();
 
         // Per the Matter spec, Stop cancels any pending motion, so Target should collapse to Current.
         // TargetPositionLiftPercent100ths is a nullable attribute, so it must be updated with a
         // nullable value or esp_matter rejects the write with ESP_ERR_INVALID_ARG.
-        uint8_t percentage = blindController.getPositionPercentage();
+        uint8_t percentage = controller->getPositionPercentage();
         esp_matter_attr_val_t position_100ths = esp_matter_nullable_uint16(nullable<uint16_t>(static_cast<uint16_t>(percentage) * 100));
-        attribute::update(window_covering_endpoint_id, WindowCovering::Id,
+        attribute::update(mEndpoint, WindowCovering::Id,
                           WindowCovering::Attributes::TargetPositionLiftPercent100ths::Id, &position_100ths);
 
         return CHIP_NO_ERROR;
     }
+
+private:
+    BlindController *controller = nullptr;
 };
 
-static BlindWindowCoveringDelegate windowCoveringDelegate;
-
-// Mirrors BlindController's current-position estimate into the Matter data model. Fired on
-// move start/interruption and on natural completion, so Home Assistant sees the resting
-// position even if a move gets redirected partway through. Does not touch the Target
-// attribute: on completion current == target already, and on interruption the Target
-// attribute has just been set to the new target by the caller of HandleMovement, so
-// overwriting it here would clobber that.
-// CurrentPositionLiftPercent100ths and CurrentPositionLiftPercentage were both created as nullable
-// attributes, so they must be updated with nullable values or esp_matter rejects the write with
-// ESP_ERR_INVALID_ARG (silently leaving the attribute, and Home Assistant's display, stale).
-static void onBlindPositionChanged(uint8_t percentage)
-{
-    esp_matter_attr_val_t position_100ths = esp_matter_nullable_uint16(nullable<uint16_t>(static_cast<uint16_t>(percentage) * 100));
-    attribute::update(window_covering_endpoint_id, WindowCovering::Id,
-                      WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id, &position_100ths);
-
-    // Kept in sync for clients (e.g. Home Assistant) that only read the legacy percentage attribute.
-    esp_matter_attr_val_t position_percentage = esp_matter_nullable_uint8(nullable<uint8_t>(percentage));
-    attribute::update(window_covering_endpoint_id, WindowCovering::Id,
-                      WindowCovering::Attributes::CurrentPositionLiftPercentage::Id, &position_percentage);
-}
+static BlindWindowCoveringDelegate windowCoveringDelegates[kMaxBlinds];
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 extern const uint8_t cd_start[] asm("_binary_certification_declaration_der_start");
@@ -237,6 +247,45 @@ static esp_err_t app_identification_cb(identification::callback_type_t type, uin
     return ESP_OK;
 }
 
+// Finds which blind (if any) an endpoint id belongs to. Linear scan is fine: at most kMaxBlinds
+// (8) entries.
+static BlindController *find_blind_controller(uint16_t endpoint_id)
+{
+    for (uint8_t i = 0; i < g_num_blinds; ++i)
+    {
+        if (window_covering_endpoint_ids[i] == endpoint_id)
+        {
+            return &blindControllers[i];
+        }
+    }
+    return nullptr;
+}
+
+static void reboot_timer_callback(void *arg)
+{
+    esp_restart();
+}
+
+// NumBlinds changes which endpoints exist, and this firmware only builds that endpoint set
+// once, at boot. Rather than adding/removing endpoints live, apply the change by rebooting
+// shortly after the write — the delay gives the write's own acknowledgement time to go out
+// over the network before the reset.
+static void schedule_reboot()
+{
+    static esp_timer_handle_t reboot_timer = nullptr;
+    if (reboot_timer == nullptr)
+    {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &reboot_timer_callback,
+            .arg = nullptr,
+            .name = "num_blinds_reboot",
+        };
+        esp_timer_create(&timer_args, &reboot_timer);
+    }
+    esp_timer_start_once(reboot_timer, 2000000); // 2s
+    ESP_LOGW(TAG, "NumBlinds changed; rebooting in 2s to apply");
+}
+
 // This callback is called for every attribute update. The callback implementation shall
 // handle the desired attributes and return an appropriate error code. If the attribute
 // is not of your interest, please do not return an error code and strictly return ESP_OK.
@@ -249,22 +298,33 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
     {
         if (cluster_id == BlindConfig::kClusterId)
         {
-            if (attribute_id == BlindConfig::kLowerTimeAttributeId)
+            BlindController *controller = find_blind_controller(endpoint_id);
+            if (controller != nullptr)
             {
-                blindController.blindLowerTimeMs = val->val.u32;
+                if (attribute_id == BlindConfig::kLowerTimeAttributeId)
+                {
+                    controller->blindLowerTimeMs = val->val.u32;
+                }
+                else if (attribute_id == BlindConfig::kRiseTimeAttributeId)
+                {
+                    controller->blindRiseTimeMs = val->val.u32;
+                }
+                else if (attribute_id == BlindConfig::kChannelAttributeId)
+                {
+                    controller->blindRadioChannel = val->val.u8;
+                }
+                else if (attribute_id == BlindConfig::kRemoteIdAttributeId)
+                {
+                    controller->blindRemoteId = val->val.u32;
+                }
             }
-            else if (attribute_id == BlindConfig::kRiseTimeAttributeId)
-            {
-                blindController.blindRiseTimeMs = val->val.u32;
-            }
-            else if (attribute_id == BlindConfig::kChannelAttributeId)
-            {
-                blindController.blindRadioChannel = val->val.u8;
-            }
-            else if (attribute_id == BlindConfig::kRemoteIdAttributeId)
-            {
-                blindController.blindRemoteId = val->val.u32;
-            }
+        }
+    }
+    else if (type == POST_UPDATE)
+    {
+        if (cluster_id == SystemConfig::kClusterId && attribute_id == SystemConfig::kNumBlindsAttributeId)
+        {
+            schedule_reboot();
         }
     }
 
@@ -285,95 +345,158 @@ extern "C" void app_main()
     node_t *node = node::create(&node_config, app_attribute_update_cb, app_identification_cb);
     ABORT_APP_ON_FAILURE(node != nullptr, ESP_LOGE(TAG, "Failed to create Matter node"));
 
-    window_covering::config_t window_covering_config;
-    window_covering_config.window_covering.type = (uint8_t)WindowCovering::Type::kRollerShadeExterior;
-    window_covering_config.window_covering.feature_flags = cluster::window_covering::feature::lift::get_id() |
-                                                            cluster::window_covering::feature::position_aware_lift::get_id();
-    // Nullable positions default to null; Home Assistant's discovery skips creating the cover entity
-    // entirely if CurrentPositionLiftPercent100ths reads as null, so give it a concrete starting value.
-    window_covering_config.window_covering.features.position_aware_lift.current_position_lift_percent_100ths = nullable<uint16_t>(0);
-    window_covering_config.window_covering.features.position_aware_lift.target_position_lift_percent_100ths = nullable<uint16_t>(0);
-    // Operational + Online. The LiftPositionAware bit is OR'd in automatically when the feature is added below.
-    window_covering_config.window_covering.config_status = (uint8_t)WindowCovering::ConfigStatus::kOperational |
-                                                            (uint8_t)WindowCovering::ConfigStatus::kOnlineReserved;
-    window_covering_config.window_covering.delegate = &windowCoveringDelegate;
+    // Custom cluster on the root endpoint (always exists, unlike the dynamic blind endpoints
+    // created below) exposing how many blind endpoints to instantiate. Must be created and read
+    // before the endpoint-creation loop below, since it determines that loop's bound.
+    endpoint_t *root_endpoint = endpoint::get(node, 0);
+    ABORT_APP_ON_FAILURE(root_endpoint != nullptr, ESP_LOGE(TAG, "Failed to get root endpoint"));
 
-    // endpoint handles can be used to add/modify clusters.
-    endpoint_t *endpoint = window_covering::create(node, &window_covering_config, ENDPOINT_FLAG_NONE, nullptr);
-    ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create window covering endpoint"));
+    cluster_t *system_config_cluster = cluster::create(root_endpoint, SystemConfig::kClusterId, CLUSTER_FLAG_SERVER);
+    ABORT_APP_ON_FAILURE(system_config_cluster != nullptr, ESP_LOGE(TAG, "Failed to create system config cluster"));
 
-    window_covering_endpoint_id = endpoint::get_id(endpoint);
-    ESP_LOGI(TAG, "Window covering created with endpoint_id %d", window_covering_endpoint_id);
-
-    windowCoveringDelegate.SetEndpoint(window_covering_endpoint_id);
-
-    // Home Assistant's cover platform keys off this legacy attribute; esp-matter does not add it automatically.
-    cluster_t *window_covering_cluster = cluster::get(endpoint, WindowCovering::Id);
-    cluster::window_covering::attribute::create_current_position_lift_percentage(window_covering_cluster, nullable<uint8_t>(0));
-
-    /* Mark deferred persistence for the position attribute since it changes rapidly while moving */
-    attribute_t *current_position_attribute = attribute::get(window_covering_endpoint_id, WindowCovering::Id,
-                                                              WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id);
-    attribute::set_deferred_persistence(current_position_attribute);
-
-    // This attribute is nonvolatile, so attribute::create() above already restored it from NVS
-    // (falling back to the 0 default on first-ever boot). Read it back so BlindController starts
-    // from the real last-known position instead of assuming fully open after a reset.
-    esp_matter_attr_val_t restored_position_100ths = esp_matter_invalid(nullptr);
-    attribute::get_val(current_position_attribute, &restored_position_100ths);
-    uint8_t restored_percentage = static_cast<uint8_t>(restored_position_100ths.val.u16 / 100);
-
-    // Custom cluster exposing the blind's travel timings so they can be tuned over Matter.
-    cluster_t *blind_config_cluster = cluster::create(endpoint, BlindConfig::kClusterId, CLUSTER_FLAG_SERVER);
-    ABORT_APP_ON_FAILURE(blind_config_cluster != nullptr, ESP_LOGE(TAG, "Failed to create blind config cluster"));
-
-    attribute_t *lower_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kLowerTimeAttributeId,
+    attribute_t *num_blinds_attribute = attribute::create(system_config_cluster, SystemConfig::kNumBlindsAttributeId,
                                                            ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
-                                                           esp_matter_uint32(blindController.blindLowerTimeMs));
-    attribute::add_bounds(lower_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
-                          esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+                                                           esp_matter_uint8(1));
+    attribute::add_bounds(num_blinds_attribute, esp_matter_uint8(SystemConfig::kMinBlinds),
+                          esp_matter_uint8(SystemConfig::kMaxBlinds));
 
-    attribute_t *rise_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kRiseTimeAttributeId,
-                                                          ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
-                                                          esp_matter_uint32(blindController.blindRiseTimeMs));
-    attribute::add_bounds(rise_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
-                          esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+    // This attribute is nonvolatile, so attribute::create() above already restored any value
+    // persisted from before a reset (falling back to the default of 1 on first-ever boot). The
+    // bounds check above guards normal writes, but a corrupted NVS record (e.g. from a future
+    // firmware downgrade) bypasses that path, so clamp defensively before using it as a loop bound.
+    esp_matter_attr_val_t restored_num_blinds = esp_matter_invalid(nullptr);
+    attribute::get_val(num_blinds_attribute, &restored_num_blinds);
+    g_num_blinds = restored_num_blinds.val.u8;
+    if (g_num_blinds < SystemConfig::kMinBlinds || g_num_blinds > SystemConfig::kMaxBlinds)
+    {
+        ESP_LOGW(TAG, "Persisted NumBlinds %u out of range, falling back to 1", g_num_blinds);
+        g_num_blinds = 1;
+    }
 
-    attribute_t *channel_attribute = attribute::create(blind_config_cluster, BlindConfig::kChannelAttributeId,
-                                                        ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
-                                                        esp_matter_uint8(blindController.blindRadioChannel));
-    attribute::add_bounds(channel_attribute, esp_matter_uint8(BlindConfig::kMinChannel),
-                          esp_matter_uint8(BlindConfig::kMaxChannel));
-
-    attribute_t *remote_id_attribute = attribute::create(blind_config_cluster, BlindConfig::kRemoteIdAttributeId,
-                                                          ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
-                                                          esp_matter_uint32(blindController.blindRemoteId));
-    attribute::add_bounds(remote_id_attribute, esp_matter_uint32(0), esp_matter_uint32(BlindConfig::kMaxRemoteId));
-
-    // These attributes are nonvolatile, so attribute::create() above already restored any value
-    // persisted from before a reset (falling back to the default passed in above on first-ever boot).
-    // Read them back so BlindController starts with the real configured values.
-    esp_matter_attr_val_t restored_lower_time = esp_matter_invalid(nullptr);
-    attribute::get_val(lower_time_attribute, &restored_lower_time);
-    blindController.blindLowerTimeMs = restored_lower_time.val.u32;
-
-    esp_matter_attr_val_t restored_rise_time = esp_matter_invalid(nullptr);
-    attribute::get_val(rise_time_attribute, &restored_rise_time);
-    blindController.blindRiseTimeMs = restored_rise_time.val.u32;
-
-    esp_matter_attr_val_t restored_channel = esp_matter_invalid(nullptr);
-    attribute::get_val(channel_attribute, &restored_channel);
-    blindController.blindRadioChannel = restored_channel.val.u8;
-
-    esp_matter_attr_val_t restored_remote_id = esp_matter_invalid(nullptr);
-    attribute::get_val(remote_id_attribute, &restored_remote_id);
-    blindController.blindRemoteId = restored_remote_id.val.u32;
-
-    // Initialize drivers
+    // Initialize the shared radio once; each blind's BlindController below gets its own init()
+    // call inside the loop, but they all drive commands through this same radioController.
     buttonDriver.init();
     sx1276Driver.init();
     radioController.init(sx1276Driver);
-    blindController.init(radioController, onBlindPositionChanged, restored_percentage);
+
+    for (uint8_t i = 0; i < g_num_blinds; ++i)
+    {
+        window_covering::config_t window_covering_config;
+        window_covering_config.window_covering.type = (uint8_t)WindowCovering::Type::kRollerShadeExterior;
+        window_covering_config.window_covering.feature_flags = cluster::window_covering::feature::lift::get_id() |
+                                                                cluster::window_covering::feature::position_aware_lift::get_id();
+        // Nullable positions default to null; Home Assistant's discovery skips creating the cover entity
+        // entirely if CurrentPositionLiftPercent100ths reads as null, so give it a concrete starting value.
+        window_covering_config.window_covering.features.position_aware_lift.current_position_lift_percent_100ths = nullable<uint16_t>(0);
+        window_covering_config.window_covering.features.position_aware_lift.target_position_lift_percent_100ths = nullable<uint16_t>(0);
+        // Operational + Online. The LiftPositionAware bit is OR'd in automatically when the feature is added below.
+        window_covering_config.window_covering.config_status = (uint8_t)WindowCovering::ConfigStatus::kOperational |
+                                                                (uint8_t)WindowCovering::ConfigStatus::kOnlineReserved;
+        window_covering_config.window_covering.delegate = &windowCoveringDelegates[i];
+
+        // endpoint handles can be used to add/modify clusters.
+        endpoint_t *endpoint = window_covering::create(node, &window_covering_config, ENDPOINT_FLAG_NONE, nullptr);
+        ABORT_APP_ON_FAILURE(endpoint != nullptr, ESP_LOGE(TAG, "Failed to create window covering endpoint"));
+
+        window_covering_endpoint_ids[i] = endpoint::get_id(endpoint);
+        ESP_LOGI(TAG, "Window covering %u created with endpoint_id %d", i, window_covering_endpoint_ids[i]);
+
+        windowCoveringDelegates[i].SetEndpoint(window_covering_endpoint_ids[i]);
+        windowCoveringDelegates[i].SetBlindController(&blindControllers[i]);
+
+        // Home Assistant's cover platform keys off this legacy attribute; esp-matter does not add it automatically.
+        cluster_t *window_covering_cluster = cluster::get(endpoint, WindowCovering::Id);
+        cluster::window_covering::attribute::create_current_position_lift_percentage(window_covering_cluster, nullable<uint8_t>(0));
+
+        /* Mark deferred persistence for the position attribute since it changes rapidly while moving */
+        attribute_t *current_position_attribute = attribute::get(window_covering_endpoint_ids[i], WindowCovering::Id,
+                                                                  WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id);
+        attribute::set_deferred_persistence(current_position_attribute);
+
+        // This attribute is nonvolatile, so attribute::create() above already restored it from NVS
+        // (falling back to the 0 default on first-ever boot). Read it back so BlindController starts
+        // from the real last-known position instead of assuming fully open after a reset.
+        esp_matter_attr_val_t restored_position_100ths = esp_matter_invalid(nullptr);
+        attribute::get_val(current_position_attribute, &restored_position_100ths);
+        uint8_t restored_percentage = static_cast<uint8_t>(restored_position_100ths.val.u16 / 100);
+
+        // Custom cluster exposing the blind's travel timings so they can be tuned over Matter.
+        cluster_t *blind_config_cluster = cluster::create(endpoint, BlindConfig::kClusterId, CLUSTER_FLAG_SERVER);
+        ABORT_APP_ON_FAILURE(blind_config_cluster != nullptr, ESP_LOGE(TAG, "Failed to create blind config cluster"));
+
+        attribute_t *lower_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kLowerTimeAttributeId,
+                                                               ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                               esp_matter_uint32(blindControllers[i].blindLowerTimeMs));
+        attribute::add_bounds(lower_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
+                              esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+
+        attribute_t *rise_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kRiseTimeAttributeId,
+                                                              ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                              esp_matter_uint32(blindControllers[i].blindRiseTimeMs));
+        attribute::add_bounds(rise_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
+                              esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+
+        // Fresh-boot default: give each blind a distinct channel (1, 2, 3, ...) instead of every
+        // instance defaulting to BlindController's same hardcoded value. A value persisted from
+        // before a reset still overrides this via the restored_channel read-back below.
+        blindControllers[i].blindRadioChannel = static_cast<uint8_t>(i + 1);
+        attribute_t *channel_attribute = attribute::create(blind_config_cluster, BlindConfig::kChannelAttributeId,
+                                                            ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                            esp_matter_uint8(blindControllers[i].blindRadioChannel));
+        attribute::add_bounds(channel_attribute, esp_matter_uint8(BlindConfig::kMinChannel),
+                              esp_matter_uint8(BlindConfig::kMaxChannel));
+
+        attribute_t *remote_id_attribute = attribute::create(blind_config_cluster, BlindConfig::kRemoteIdAttributeId,
+                                                              ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                              esp_matter_uint32(blindControllers[i].blindRemoteId));
+        attribute::add_bounds(remote_id_attribute, esp_matter_uint32(0), esp_matter_uint32(BlindConfig::kMaxRemoteId));
+
+        // These attributes are nonvolatile, so attribute::create() above already restored any value
+        // persisted from before a reset (falling back to the default passed in above on first-ever boot).
+        // Read them back so BlindController starts with the real configured values.
+        esp_matter_attr_val_t restored_lower_time = esp_matter_invalid(nullptr);
+        attribute::get_val(lower_time_attribute, &restored_lower_time);
+        blindControllers[i].blindLowerTimeMs = restored_lower_time.val.u32;
+
+        esp_matter_attr_val_t restored_rise_time = esp_matter_invalid(nullptr);
+        attribute::get_val(rise_time_attribute, &restored_rise_time);
+        blindControllers[i].blindRiseTimeMs = restored_rise_time.val.u32;
+
+        esp_matter_attr_val_t restored_channel = esp_matter_invalid(nullptr);
+        attribute::get_val(channel_attribute, &restored_channel);
+        blindControllers[i].blindRadioChannel = restored_channel.val.u8;
+
+        esp_matter_attr_val_t restored_remote_id = esp_matter_invalid(nullptr);
+        attribute::get_val(remote_id_attribute, &restored_remote_id);
+        blindControllers[i].blindRemoteId = restored_remote_id.val.u32;
+
+        // Mirrors this blind's current-position estimate into the Matter data model. Fired on
+        // move start/interruption and on natural completion, so Home Assistant sees the resting
+        // position even if a move gets redirected partway through. Does not touch the Target
+        // attribute: on completion current == target already, and on interruption the Target
+        // attribute has just been set to the new target by the caller of HandleMovement, so
+        // overwriting it here would clobber that. CurrentPositionLiftPercent100ths and
+        // CurrentPositionLiftPercentage were both created as nullable attributes, so they must be
+        // updated with nullable values or esp_matter rejects the write with ESP_ERR_INVALID_ARG
+        // (silently leaving the attribute, and Home Assistant's display, stale). Captures this
+        // blind's endpoint id by value since it never changes after creation.
+        uint16_t endpoint_id_for_callback = window_covering_endpoint_ids[i];
+        blindControllers[i].init(
+            radioController,
+            [endpoint_id_for_callback](uint8_t percentage)
+            {
+                esp_matter_attr_val_t position_100ths =
+                    esp_matter_nullable_uint16(nullable<uint16_t>(static_cast<uint16_t>(percentage) * 100));
+                attribute::update(endpoint_id_for_callback, WindowCovering::Id,
+                                  WindowCovering::Attributes::CurrentPositionLiftPercent100ths::Id, &position_100ths);
+
+                // Kept in sync for clients (e.g. Home Assistant) that only read the legacy percentage attribute.
+                esp_matter_attr_val_t position_percentage = esp_matter_nullable_uint8(nullable<uint8_t>(percentage));
+                attribute::update(endpoint_id_for_callback, WindowCovering::Id,
+                                  WindowCovering::Attributes::CurrentPositionLiftPercentage::Id, &position_percentage);
+            },
+            restored_percentage);
+    }
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
     auto * dac_provider = get_dac_provider();

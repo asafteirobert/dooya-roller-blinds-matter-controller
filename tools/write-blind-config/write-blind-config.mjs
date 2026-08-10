@@ -1,6 +1,7 @@
-// Standalone matter.js controller script to write the BlindConfig custom cluster's
-// attributes (blindLowerTimeMs / blindRiseTimeMs / blindRadioChannel / blindRemoteId) on
-// the roller blind controller.
+// Standalone matter.js controller script to write manufacturer-specific config attributes
+// on the roller blind controller: the per-blind BlindConfig cluster (blindLowerTimeMs /
+// blindRiseTimeMs / blindRadioChannel / blindRemoteId), and the root-endpoint SystemConfig
+// cluster's NumBlinds attribute, which controls how many blind endpoints the device creates.
 //
 // Why this exists instead of a simpler option:
 //  - matter-server refuses to write attributes on clusters it has no built-in definition
@@ -9,20 +10,27 @@
 //    (confirmed via its --help output).
 // This script commissions itself as an independent Matter controller/fabric admin on
 // the device (Matter supports multiple simultaneous admins, so this does NOT remove or
-// disturb the existing Home Assistant pairing), then defines the custom cluster's schema
-// itself so it can issue a real write via matter.js's low-level InteractionClient.
+// disturb the existing Home Assistant pairing), then defines the custom clusters' schemas
+// itself so it can issue real writes via matter.js's low-level InteractionClient.
 //
 // The commissioning/connection code here mirrors @matter/nodejs-shell's own
 // MatterNode.ts and cmd_commission.ts (read directly from the installed package's
 // source to make sure this uses real, working API calls, not guesses). The attribute
 // write uses InteractionClient.setAttribute() from @project-chip/matter.js, which needs
 // a ClusterType.Attribute descriptor {id, name, schema} — built by hand here via
-// @matter/model's AttributeModel, since our cluster isn't one matter.js knows about.
+// @matter/model's AttributeModel, since our clusters aren't ones matter.js knows about.
 //
 // Setup:
 //   npm install                                             (from this directory)
-//   node write-blind-config.mjs --lower <ms> --rise <ms> --channel <n> --remote-id <hex>
-//   (any subset of --lower/--rise/--channel/--remote-id is fine, as long as at least one is given)
+//   node write-blind-config.mjs [--endpoint <n>] --lower <ms> --rise <ms> --channel <n> --remote-id <hex>
+//   node write-blind-config.mjs --num-blinds <n>
+//   (any subset of --lower/--rise/--channel/--remote-id/--num-blinds is fine, as long as at
+//   least one is given; --endpoint selects which blind's BlindConfig cluster the first four
+//   target, default 1, and is ignored by --num-blinds, which always targets endpoint 0)
+//
+// --num-blinds triggers a reboot on the device ~2s after the write completes, to rebuild its
+// set of blind endpoints. If combined with per-blind flags in the same invocation, those are
+// written first, so they aren't cut off by the reboot.
 //
 // First run: commissions this script onto the device, which needs a pairing code passed
 // via --pairing-code. Get one from Home Assistant: open the blind controller's device
@@ -42,36 +50,51 @@ import { GeneralCommissioning } from "@matter/types/clusters";
 import { CommissioningController } from "@project-chip/matter.js";
 import { NodeStateInformation } from "@project-chip/matter.js/device";
 
-// --- Fill this in ---
-const ENDPOINT_ID = 1; // window_covering_endpoint_id, logged by the device as
-                        // "Window covering created with endpoint_id X" over serial/CLI
-// ---------------------
-
-const CLUSTER_ID = 0xfff1fc00;
+const BLIND_CONFIG_CLUSTER_ID = 0xfff1fc00;
+const SYSTEM_CONFIG_CLUSTER_ID = 0xfff1fc01;
 
 // Mirrors BlindConfig::kMinChannel/kMaxChannel and BlindConfig::kMaxRemoteId in app_main.cpp.
 const MIN_CHANNEL = 0;
 const MAX_CHANNEL = 15;
 const MAX_REMOTE_ID = 0xffffff;
 
+// Mirrors SystemConfig::kMinBlinds/kMaxBlinds in app_main.cpp.
+const MIN_BLINDS = 1;
+const MAX_BLINDS = 8;
+
+const DEFAULT_ENDPOINT_ID = 1;
+
 const USAGE =
-    "Usage: node write-blind-config.mjs [--lower <ms>] [--rise <ms>] [--channel <n>]\n" +
-    "                                    [--remote-id <hex-or-decimal>] [--pairing-code <code>]\n" +
-    "  At least one of --lower/--rise/--channel/--remote-id is required.\n" +
+    "Usage: node write-blind-config.mjs [--endpoint <n>] [--lower <ms>] [--rise <ms>]\n" +
+    "                                    [--channel <n>] [--remote-id <hex-or-decimal>]\n" +
+    "                                    [--num-blinds <n>] [--pairing-code <code>]\n" +
+    "  At least one of --lower/--rise/--channel/--remote-id/--num-blinds is required.\n" +
+    `  --endpoint selects which blind's config cluster --lower/--rise/--channel/--remote-id\n` +
+    `  target (default ${DEFAULT_ENDPOINT_ID}, the device's serial log shows each blind's endpoint id as\n` +
+    `  "Window covering N created with endpoint_id X"). --num-blinds always targets endpoint 0\n` +
+    "  regardless of --endpoint, and makes the device reboot ~2s after the write to rebuild its\n" +
+    "  set of blind endpoints.\n" +
     "  --pairing-code is only required the first time, before this device is commissioned\n" +
     "  onto this script's fabric (or again after that pairing is lost, e.g. a factory reset).";
 
-// Parses --lower/--rise/--channel/--remote-id/--pairing-code from argv. The four value flags
-// are all optional, but at least one must be given — this is a manual write utility, so
-// silently doing nothing would be more confusing than refusing to run. --pairing-code is
-// optional too: it's only actually needed the first time (or after the device stops trusting
-// our fabric); commission() below is what enforces that, since only it knows whether
-// commissioning is actually happening.
+// Parses --endpoint/--lower/--rise/--channel/--remote-id/--num-blinds/--pairing-code from argv.
+// The value flags are all optional, but at least one must be given — this is a manual write
+// utility, so silently doing nothing would be more confusing than refusing to run.
+// --pairing-code is optional too: it's only actually needed the first time (or after the device
+// stops trusting our fabric); commission() below is what enforces that, since only it knows
+// whether commissioning is actually happening.
 function parseArgs(argv) {
-    const result = {};
+    const result = { endpointId: DEFAULT_ENDPOINT_ID };
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
-        if (arg === "--lower" || arg === "--rise") {
+        if (arg === "--endpoint") {
+            const raw = argv[++i];
+            const value = Number(raw);
+            if (raw === undefined || !Number.isInteger(value) || value < 1) {
+                throw new Error(`${arg} needs a positive integer endpoint id, got ${JSON.stringify(raw)}`);
+            }
+            result.endpointId = value;
+        } else if (arg === "--lower" || arg === "--rise") {
             const key = arg === "--lower" ? "lowerTimeMs" : "riseTimeMs";
             const raw = argv[++i];
             const value = Number(raw);
@@ -93,6 +116,13 @@ function parseArgs(argv) {
                 throw new Error(`${arg} needs an integer between 0 and 0x${MAX_REMOTE_ID.toString(16)}, got ${JSON.stringify(raw)}`);
             }
             result.remoteId = value;
+        } else if (arg === "--num-blinds") {
+            const raw = argv[++i];
+            const value = Number(raw);
+            if (raw === undefined || !Number.isInteger(value) || value < MIN_BLINDS || value > MAX_BLINDS) {
+                throw new Error(`${arg} needs an integer between ${MIN_BLINDS} and ${MAX_BLINDS}, got ${JSON.stringify(raw)}`);
+            }
+            result.numBlinds = value;
         } else if (arg === "--pairing-code") {
             const raw = argv[++i];
             if (!raw) {
@@ -107,7 +137,8 @@ function parseArgs(argv) {
         result.lowerTimeMs === undefined &&
         result.riseTimeMs === undefined &&
         result.channel === undefined &&
-        result.remoteId === undefined
+        result.remoteId === undefined &&
+        result.numBlinds === undefined
     ) {
         throw new Error(USAGE);
     }
@@ -128,6 +159,7 @@ const LowerTimeMs = buildAttribute(0x0000, "LowerTimeMs");
 const RiseTimeMs = buildAttribute(0x0001, "RiseTimeMs");
 const Channel = buildAttribute(0x0002, "Channel", "uint8");
 const RemoteId = buildAttribute(0x0003, "RemoteId");
+const NumBlinds = buildAttribute(0x0000, "NumBlinds", "uint8");
 
 // Commissions a fresh node using pairingCode and waits for it to be ready. pairingCode is
 // only required here, at the point commissioning is actually about to happen — an
@@ -233,7 +265,9 @@ async function connectOrRecommission(commissioningController, pairingCode) {
 
 async function main() {
     // Parse first and fail fast on bad args, before touching the network/commissioning at all.
-    const { lowerTimeMs, riseTimeMs, channel, remoteId, pairingCode } = parseArgs(process.argv.slice(2));
+    const { endpointId, lowerTimeMs, riseTimeMs, channel, remoteId, numBlinds, pairingCode } = parseArgs(
+        process.argv.slice(2),
+    );
 
     const environment = Environment.default;
 
@@ -265,25 +299,28 @@ async function main() {
 
         const interactionClient = await node.getInteractionClient();
 
+        // numBlinds is listed last: it triggers a reboot ~2s after landing, so any per-blind
+        // writes above should already be on their way to the device before that happens.
         const writes = [
-            { value: lowerTimeMs, attribute: LowerTimeMs },
-            { value: riseTimeMs, attribute: RiseTimeMs },
-            { value: channel, attribute: Channel },
-            { value: remoteId, attribute: RemoteId },
+            { value: lowerTimeMs, attribute: LowerTimeMs, endpointId, clusterId: BLIND_CONFIG_CLUSTER_ID },
+            { value: riseTimeMs, attribute: RiseTimeMs, endpointId, clusterId: BLIND_CONFIG_CLUSTER_ID },
+            { value: channel, attribute: Channel, endpointId, clusterId: BLIND_CONFIG_CLUSTER_ID },
+            { value: remoteId, attribute: RemoteId, endpointId, clusterId: BLIND_CONFIG_CLUSTER_ID },
+            { value: numBlinds, attribute: NumBlinds, endpointId: 0, clusterId: SYSTEM_CONFIG_CLUSTER_ID },
         ];
-        for (const { value, attribute } of writes) {
+        for (const { value, attribute, endpointId: writeEndpointId, clusterId } of writes) {
             if (value === undefined) {
                 continue;
             }
             await interactionClient.setAttribute({
                 attributeData: {
-                    endpointId: EndpointNumber(ENDPOINT_ID),
-                    clusterId: ClusterId(CLUSTER_ID),
+                    endpointId: EndpointNumber(writeEndpointId),
+                    clusterId: ClusterId(clusterId),
                     attribute,
                     value,
                 },
             });
-            console.log(`Wrote ${attribute.name} = ${value}`);
+            console.log(`Wrote ${attribute.name} = ${value} (endpoint ${writeEndpointId})`);
         }
     } finally {
         await commissioningController.close();
