@@ -29,6 +29,7 @@
 
 #include "ButtonDriver.hpp"
 #include "BlindController.hpp"
+#include "CliCommands.hpp"
 #include "RadioController.hpp"
 #include "SX1276Driver.hpp"
 
@@ -45,11 +46,9 @@ using namespace chip::DeviceLayer;
 
 static const char *TAG = "app_main";
 
-// Maximum number of blinds this firmware can be configured to control. Bounds the NumBlinds
-// attribute (see SystemConfig below) and sizes the per-blind static arrays below (this codebase
-// does no heap allocation, so the arrays are sized to the hard max and only the first
-// numBlinds entries are ever used).
-constexpr uint8_t MAX_BLINDS = 8;
+// MAX_BLINDS (see Constants.hpp) bounds the NumBlinds attribute (see SystemConfig below) and
+// sizes the per-blind static arrays below (this codebase does no heap allocation, so the arrays
+// are sized to the hard max and only the first numBlinds entries are ever used).
 
 ButtonDriver buttonDriver;
 RadioController radioController;
@@ -496,6 +495,11 @@ extern "C" void app_main()
                                   WindowCovering::Attributes::CurrentPositionLiftPercentage::Id, &position_percentage);
             },
             restored_percentage);
+
+        // Lets RadioController route commands decoded from the physical remote (identified by
+        // this blind's remoteId/channel, read live off blindControllers[i] -- see
+        // RadioController::registerBlind) to this blind's handleRemoteCommand().
+        radioController.registerBlind(blindControllers[i]);
     }
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
@@ -524,6 +528,7 @@ extern "C" void app_main()
 #if CONFIG_OPENTHREAD_CLI
     esp_matter::console::otcli_register_commands();
 #endif
+    cli_register_commands(sx1276Driver);
     esp_matter::console::init();
 #endif
 

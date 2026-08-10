@@ -26,6 +26,15 @@ public:
               uint8_t initialPercentage = 0);
     void moveTo(uint8_t targetPercentage);
     void stop();
+
+    // Reacts to a button press decoded off the physical remote paired to this blind (relayed via
+    // RadioController::registerBlind). Behaves exactly like moveTo(0)/moveTo(100)/stop() -- UP and
+    // DOWN drive towards the matching end position until stopped, matching how the tubular motor
+    // itself behaves when driven directly by the remote -- except it never re-sends a radio
+    // command: the motor already received this press directly from the remote, so relaying it
+    // back out would just be a redundant, possibly disruptive, retransmission.
+    void handleRemoteCommand(RadioController::Command command);
+
     uint8_t getPositionPercentage() const;
     bool isMoving() const;
 
@@ -45,6 +54,11 @@ private:
         UP,
         DOWN
     };
+
+    // Shared implementations behind moveTo()/stop() and handleRemoteCommand(): identical except
+    // for whether the resulting UP/DOWN/STOP is actually transmitted.
+    void moveToInternal(uint8_t targetPercentage, bool sendRadioCommand);
+    void stopInternal(bool sendRadioCommand);
 
     // All of these assume the mutex is already held by the caller.
     void syncPercentageToElapsedTravelLocked();
