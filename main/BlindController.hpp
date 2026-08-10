@@ -22,7 +22,7 @@ public:
 
     ~BlindController();
 
-    void init(RadioController& radioController, uint8_t blindId, PositionChangedCallback onPositionChanged = nullptr,
+    void init(RadioController& radioController, PositionChangedCallback onPositionChanged = nullptr,
               uint8_t initialPercentage = 0);
     void moveTo(uint8_t targetPercentage);
     void stop();
@@ -30,9 +30,14 @@ public:
     bool isMoving() const;
 
     // Time it takes to go from fully open to fully closed
-    uint8_t BLIND_LOWER_TIME_SECONDS = 24;
+    uint32_t blindLowerTimeMs = 24000;
     // Time it takes to go from fully closed to fully open
-    uint8_t BLIND_RISE_TIME_SECONDS = 25;
+    uint32_t blindRiseTimeMs = 25000;
+    // Remote channel number this instance controls
+    uint8_t blindRadioChannel = 1;
+    // Dooya remote ID transmitted with each command, as configured on the physical remote
+    // this blind is paired to
+    uint32_t blindRemoteId = 0x9a66ab;
 private:
     enum class Direction
     {
@@ -53,7 +58,6 @@ private:
     esp_timer_handle_t stopTimer = nullptr;
     mutable SemaphoreHandle_t mutex = nullptr;
 
-    uint8_t blindId = 0;
     uint8_t currentPercentage = 0;
     uint8_t targetPercentage = 0;
     uint8_t moveStartPercentage = 0;

@@ -57,6 +57,31 @@ using namespace chip::app::Clusters;
 
 constexpr auto k_timeout_seconds = 300;
 
+// Manufacturer-specific cluster exposing BlindController's per-installation settings (travel
+// timings, RF channel, remote ID), so they can be tuned over Matter instead of being
+// hardcoded. The standard WindowCovering cluster has no attributes for any of this. Home
+// Assistant does not know how to map a manufacturer cluster to an entity, so these are not
+// editable from the normal HA UI; they must be read/written through the Matter Server's raw
+// attribute interface (e.g. python-matter-server's developer tools).
+namespace BlindConfig
+{
+// CONFIG_DEVICE_VENDOR_ID (0xFFF1) is the Matter test vendor ID this build already uses;
+// FC00 is the first cluster ID in the manufacturer-specific range.
+constexpr uint32_t kClusterId = 0xFFF1FC00;
+constexpr uint32_t kLowerTimeAttributeId = 0x0000;
+constexpr uint32_t kRiseTimeAttributeId = 0x0001;
+constexpr uint32_t kChannelAttributeId = 0x0002;
+constexpr uint32_t kRemoteIdAttributeId = 0x0003;
+constexpr uint32_t kMinTravelTimeMs = 1000;
+constexpr uint32_t kMaxTravelTimeMs = 120000;
+// Dooya remotes commonly address channels 0-15 (0 often used as an "all channels" group).
+constexpr uint8_t kMinChannel = 0;
+constexpr uint8_t kMaxChannel = 15;
+// The remote ID occupies 3 bytes of the RF packet (see RadioController::sendCommand), so it
+// is a 24-bit value.
+constexpr uint32_t kMaxRemoteId = 0xFFFFFF;
+} // namespace BlindConfig
+
 // Bridges Matter WindowCovering cluster commands to BlindController.
 class BlindWindowCoveringDelegate : public WindowCovering::WindowCoveringDelegate
 {
@@ -220,10 +245,27 @@ static esp_err_t app_attribute_update_cb(attribute::callback_type_t type, uint16
 {
     esp_err_t err = ESP_OK;
 
-    if (type == PRE_UPDATE) 
+    if (type == PRE_UPDATE)
     {
-        /* Driver update */
-        // TODO
+        if (cluster_id == BlindConfig::kClusterId)
+        {
+            if (attribute_id == BlindConfig::kLowerTimeAttributeId)
+            {
+                blindController.blindLowerTimeMs = val->val.u32;
+            }
+            else if (attribute_id == BlindConfig::kRiseTimeAttributeId)
+            {
+                blindController.blindRiseTimeMs = val->val.u32;
+            }
+            else if (attribute_id == BlindConfig::kChannelAttributeId)
+            {
+                blindController.blindRadioChannel = val->val.u8;
+            }
+            else if (attribute_id == BlindConfig::kRemoteIdAttributeId)
+            {
+                blindController.blindRemoteId = val->val.u32;
+            }
+        }
     }
 
     return err;
@@ -281,11 +323,57 @@ extern "C" void app_main()
     attribute::get_val(current_position_attribute, &restored_position_100ths);
     uint8_t restored_percentage = static_cast<uint8_t>(restored_position_100ths.val.u16 / 100);
 
+    // Custom cluster exposing the blind's travel timings so they can be tuned over Matter.
+    cluster_t *blind_config_cluster = cluster::create(endpoint, BlindConfig::kClusterId, CLUSTER_FLAG_SERVER);
+    ABORT_APP_ON_FAILURE(blind_config_cluster != nullptr, ESP_LOGE(TAG, "Failed to create blind config cluster"));
+
+    attribute_t *lower_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kLowerTimeAttributeId,
+                                                           ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                           esp_matter_uint32(blindController.blindLowerTimeMs));
+    attribute::add_bounds(lower_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
+                          esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+
+    attribute_t *rise_time_attribute = attribute::create(blind_config_cluster, BlindConfig::kRiseTimeAttributeId,
+                                                          ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                          esp_matter_uint32(blindController.blindRiseTimeMs));
+    attribute::add_bounds(rise_time_attribute, esp_matter_uint32(BlindConfig::kMinTravelTimeMs),
+                          esp_matter_uint32(BlindConfig::kMaxTravelTimeMs));
+
+    attribute_t *channel_attribute = attribute::create(blind_config_cluster, BlindConfig::kChannelAttributeId,
+                                                        ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                        esp_matter_uint8(blindController.blindRadioChannel));
+    attribute::add_bounds(channel_attribute, esp_matter_uint8(BlindConfig::kMinChannel),
+                          esp_matter_uint8(BlindConfig::kMaxChannel));
+
+    attribute_t *remote_id_attribute = attribute::create(blind_config_cluster, BlindConfig::kRemoteIdAttributeId,
+                                                          ATTRIBUTE_FLAG_WRITABLE | ATTRIBUTE_FLAG_NONVOLATILE,
+                                                          esp_matter_uint32(blindController.blindRemoteId));
+    attribute::add_bounds(remote_id_attribute, esp_matter_uint32(0), esp_matter_uint32(BlindConfig::kMaxRemoteId));
+
+    // These attributes are nonvolatile, so attribute::create() above already restored any value
+    // persisted from before a reset (falling back to the default passed in above on first-ever boot).
+    // Read them back so BlindController starts with the real configured values.
+    esp_matter_attr_val_t restored_lower_time = esp_matter_invalid(nullptr);
+    attribute::get_val(lower_time_attribute, &restored_lower_time);
+    blindController.blindLowerTimeMs = restored_lower_time.val.u32;
+
+    esp_matter_attr_val_t restored_rise_time = esp_matter_invalid(nullptr);
+    attribute::get_val(rise_time_attribute, &restored_rise_time);
+    blindController.blindRiseTimeMs = restored_rise_time.val.u32;
+
+    esp_matter_attr_val_t restored_channel = esp_matter_invalid(nullptr);
+    attribute::get_val(channel_attribute, &restored_channel);
+    blindController.blindRadioChannel = restored_channel.val.u8;
+
+    esp_matter_attr_val_t restored_remote_id = esp_matter_invalid(nullptr);
+    attribute::get_val(remote_id_attribute, &restored_remote_id);
+    blindController.blindRemoteId = restored_remote_id.val.u32;
+
     // Initialize drivers
     buttonDriver.init();
     sx1276Driver.init();
     radioController.init(sx1276Driver);
-    blindController.init(radioController, 1, onBlindPositionChanged, restored_percentage);
+    blindController.init(radioController, onBlindPositionChanged, restored_percentage);
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
     auto * dac_provider = get_dac_provider();

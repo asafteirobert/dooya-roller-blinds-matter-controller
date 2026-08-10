@@ -1,0 +1,12 @@
+{
+    "name": "write-blind-config",
+    "private": true,
+    "type": "module",
+    "description": "One-off Matter controller script to configure BLIND_LOWER_TIME_MS/BLIND_RISE_TIME_MS on the roller blind controller's custom BlindConfig cluster (0xfff1fc00), bypassing matter-server's refusal to write attributes on clusters it doesn't recognize.",
+    "scripts": {
+        "write-blind-config": "node write-blind-config.mjs"
+    },
+    "dependencies": {
+        "@matter/nodejs-shell": "0.17.9"
+    }
+}

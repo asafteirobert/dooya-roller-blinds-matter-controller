@@ -7,7 +7,7 @@ void RadioController::init(SX1276Driver& sx1276Driver)
     this->driver = &sx1276Driver;
 }
 
-void RadioController::sendCommand(uint8_t channel, Command command)
+void RadioController::sendCommand(uint32_t remoteId, uint8_t channel, Command command)
 {
     ESP_LOGI(TAG, "Received command %d for channel %d", static_cast<int>(command), channel);
 
@@ -16,9 +16,9 @@ void RadioController::sendCommand(uint8_t channel, Command command)
     uint8_t check = button;
 
     std::array<uint8_t, 5> data = {
-        static_cast<uint8_t>((REMOTE_ID >> 16) & 0xFF),
-        static_cast<uint8_t>((REMOTE_ID >> 8) & 0xFF),
-        static_cast<uint8_t>(REMOTE_ID & 0xFF),
+        static_cast<uint8_t>((remoteId >> 16) & 0xFF),
+        static_cast<uint8_t>((remoteId >> 8) & 0xFF),
+        static_cast<uint8_t>(remoteId & 0xFF),
         channel,
         static_cast<uint8_t>((button << 4) | check),
     };
