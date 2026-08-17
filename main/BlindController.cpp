@@ -66,6 +66,16 @@ void BlindController::moveToInternal(uint8_t percentage, bool sendRadioCommand)
 
     xSemaphoreTake(this->mutex, portMAX_DELAY);
 
+    // A duplicate of the move already in flight (e.g. a physical remote repeating the same
+    // button while held): treating it as a fresh move would reset moveStartTimeUs, discarding
+    // the fractional travel progress made since the move actually started and dragging the
+    // position estimate away from where the blind really is. Just ignore it.
+    if (this->direction != Direction::NONE && this->targetPercentage == percentage)
+    {
+        xSemaphoreGive(this->mutex);
+        return;
+    }
+
     // A move is already in flight: figure out where the blind actually is before deciding
     // what to do next, and cancel the pending STOP for the old target.
     if (this->direction != Direction::NONE)
