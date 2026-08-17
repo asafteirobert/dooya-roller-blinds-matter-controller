@@ -200,7 +200,7 @@ void BlindController::syncPercentageToElapsedTravelLocked()
         return;
     }
 
-    int64_t totalTravelUs = static_cast<int64_t>(totalDiff) * travelMiliseconds * 1000000LL / 100;
+    int64_t totalTravelUs = static_cast<int64_t>(totalDiff) * travelMiliseconds * 1000LL / 100;
     int64_t elapsedUs = esp_timer_get_time() - this->moveStartTimeUs;
     if (elapsedUs >= totalTravelUs)
     {
