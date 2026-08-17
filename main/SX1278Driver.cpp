@@ -330,7 +330,7 @@ void SX1278Driver::configureReceiver()
     // toggling with no transmitter active. This is only a conservative starting point (double
     // the POR reset value); use the "sx1278reg" console command to tune it properly on this
     // hardware without reflashing, e.g. `sx1278reg 0x15 0x20`.
-    writeRegister(REG_OOK_FIX, 0x18);
+    writeRegister(REG_OOK_FIX, 0x43);
 
     // AgcAutoOn=1, RxTrigger=001 (Rssi interrupt): the LNA gain (re-)converges whenever RSSI
     // crosses the threshold, i.e. whenever a transmission begins after a silent gap -- exactly
