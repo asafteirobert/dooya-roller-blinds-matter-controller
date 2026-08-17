@@ -14,12 +14,12 @@
 // includes this header; spi_device_handle_t is just a pointer to this struct.
 struct spi_device_t;
 
-// Drives an SX1276 module over VSPI to replay Dooya remote control commands, and to decode the
+// Drives an SX1278 module over VSPI to replay Dooya remote control commands, and to decode the
 // same commands when the physical remote transmits them directly to the blind.
 //
 // The chip has no built-in Dooya support, so in both directions the 40-bit command is hand-coded
 // against the exact OOK/PWM pulse train the remote and motor speak, rather than relying on the
-// SX1276's packet engine (which only recognises framing this protocol doesn't have: no
+// SX1278's packet engine (which only recognises framing this protocol doesn't have: no
 // preamble/sync word/CRC).
 //
 // - send() only enqueues the command and returns immediately; a dedicated background task owns
@@ -30,9 +30,9 @@ struct spi_device_t;
 //   in that mode; a GPIO interrupt timestamps every edge and decodes it in software (mirroring
 //   the encoding transmitWaveform() produces), handing off completed frames to a receiver task
 //   which invokes the callback registered via setReceiveCallback().
-class SX1276Driver
+class SX1278Driver
 {
-    static constexpr char *TAG = "SX1276Driver";
+    static constexpr char *TAG = "SX1278Driver";
 public:
     // Invoked, from a dedicated background task (never from ISR context), with every complete
     // 40-bit frame decoded off the air while the radio is idling in receive mode.
@@ -42,8 +42,8 @@ public:
     void send(const std::array<uint8_t, 5>& data, uint8_t repeats = 1);
     void setReceiveCallback(ReceiveCallback callback);
 
-    // Diagnostic register access, exposed for interactive RF tuning via the "sx1276reg"/
-    // "sx1276rssi" console commands (see CliCommands.cpp). The OOK receive threshold in
+    // Diagnostic register access, exposed for interactive RF tuning via the "sx1278reg"/
+    // "sx1278rssi" console commands (see CliCommands.cpp). The OOK receive threshold in
     // particular (RegOokFix, see configureReceiver()) is board/environment-specific and can't be
     // gotten right from firmware defaults alone -- the datasheet's own tuning procedure is to
     // adjust it live and watch the result. Safe to call from any task, including concurrently
@@ -53,7 +53,7 @@ public:
     // finished initialising.
     bool peekRegister(uint8_t address, uint8_t& outValue);
     bool pokeRegister(uint8_t address, uint8_t value);
-    // Convenience for "sx1276rssi": instantaneous received signal strength while idling in
+    // Convenience for "sx1278rssi": instantaneous received signal strength while idling in
     // receive mode, in dBm.
     bool peekRssiDbm(double& outDbm);
 

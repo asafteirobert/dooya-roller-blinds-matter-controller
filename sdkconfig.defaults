@@ -31,13 +31,13 @@ CONFIG_ESP_MATTER_MAX_DYNAMIC_ENDPOINT_COUNT=10
 CONFIG_BUTTON_PERIOD_TIME_MS=20
 CONFIG_BUTTON_LONG_PRESS_TIME_MS=5000
 
-# SX1276Driver only uses spi_device_polling_transmit (no ISR-driven transfers), so keep the SPI
+# SX1278Driver only uses spi_device_polling_transmit (no ISR-driven transfers), so keep the SPI
 # master ISR out of the scarce internal IRAM region to avoid overflowing iram0_0_seg.
 CONFIG_SPI_MASTER_ISR_IN_IRAM=n
 
 # ButtonDriver's iot_button component installs the shared GPIO ISR service with
 # ESP_INTR_FLAG_IRAM, which makes it (and therefore every gpio_isr_handler_add'ed handler on any
-# pin, including SX1276Driver's DIO2 receive decoder) IRAM-resident and liable to run while flash
+# pin, including SX1278Driver's DIO2 receive decoder) IRAM-resident and liable to run while flash
 # cache is disabled (e.g. during an NVS write). gpio_get_level/gpio_intr_disable must therefore
 # also be IRAM-resident, or calling them from that handler risks a crash during such a window.
 CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y

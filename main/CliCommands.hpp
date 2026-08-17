@@ -1,8 +1,8 @@
 #pragma once
 #include "sdkconfig.h"
 
-class SX1276Driver;
+class SX1278Driver;
 
 #if CONFIG_ENABLE_CHIP_SHELL
-void cli_register_commands(SX1276Driver& sx1276Driver);
+void cli_register_commands(SX1278Driver& sx1278Driver);
 #endif

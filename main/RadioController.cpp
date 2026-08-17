@@ -4,9 +4,9 @@
 #include <array>
 #include <esp_log.h>
 
-void RadioController::init(SX1276Driver& sx1276Driver)
+void RadioController::init(SX1278Driver& sx1278Driver)
 {
-    this->driver = &sx1276Driver;
+    this->driver = &sx1278Driver;
     this->driver->setReceiveCallback([this](const std::array<uint8_t, 5>& data) { this->onFrameReceived(data); });
 }
 
@@ -39,7 +39,7 @@ void RadioController::registerBlind(BlindController& blindController)
     this->registeredBlinds[this->registeredBlindCount++] = &blindController;
 }
 
-// Runs on SX1276Driver's receiver task (never from ISR context), once per frame decoded off the
+// Runs on SX1278Driver's receiver task (never from ISR context), once per frame decoded off the
 // air while the radio is idling in receive mode.
 void RadioController::onFrameReceived(const std::array<uint8_t, 5>& data)
 {

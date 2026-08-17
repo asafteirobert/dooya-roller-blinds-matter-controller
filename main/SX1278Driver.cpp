@@ -1,4 +1,4 @@
-#include "SX1276Driver.hpp"
+#include "SX1278Driver.hpp"
 #include "Constants.hpp"
 
 #include <algorithm>
@@ -36,7 +36,7 @@ constexpr uint32_t BIT_RATE_BPS = 1000000 / SAMPLE_US; // one on-air bit == one 
 
 constexpr int SPI_CLOCK_HZ = 4 * 1000 * 1000; // conservative for hobby-wired breakout boards
 
-// The SX1276's FSK/OOK FIFO is only 64 bytes deep, so any payload longer than that (ours always
+// The SX1278's FSK/OOK FIFO is only 64 bytes deep, so any payload longer than that (ours always
 // is) must be streamed in while transmitting, per the "Handling Large Packets" procedure in the
 // datasheet: pre-fill, enable Tx, then keep topping up in FIFO_CHUNK-sized bursts whenever the
 // FifoLevel flag (mirrored on DIO1) says the level has dropped back to the threshold.
@@ -80,7 +80,7 @@ constexpr uint8_t RX_FRAME_BITS = 40;
 constexpr int64_t RX_POST_SYNC_GAP_MIN_US = 900;
 constexpr int64_t RX_POST_SYNC_GAP_MAX_US = 2100;
 
-// --- SX1276 FSK/OOK register map (see RFM9x/SX1276 datasheet section 6.2) ---
+// --- SX1278 FSK/OOK register map (see RFM9x/SX1278 datasheet section 6.2) ---
 constexpr uint8_t REG_FIFO = 0x00;
 constexpr uint8_t REG_OP_MODE = 0x01;
 constexpr uint8_t REG_BITRATE_MSB = 0x02;
@@ -114,14 +114,14 @@ constexpr uint8_t OPMODE_TX = MODULATION_OOK_LF | 0x03;
 constexpr uint8_t OPMODE_RX_CONTINUOUS = MODULATION_OOK_LF | 0x05;
 
 // RegPacketConfig2: DataMode=1 (Packet, used for Tx) vs. DataMode=0 (Continuous, used for Rx --
-// our protocol has no SX1276-recognised preamble/sync word for the packet engine to frame it
+// our protocol has no SX1278-recognised preamble/sync word for the packet engine to frame it
 // with, so DIO2 is read as a raw envelope and decoded in software instead; see
 // handleReceivedEdge).
 constexpr uint8_t PACKET_CONFIG2_DATA_MODE_PACKET = 0x40;
 constexpr uint8_t PACKET_CONFIG2_DATA_MODE_CONTINUOUS = 0x00;
 
 // Appends single-value-per-chip runs to a byte buffer, MSB-first, matching the bit order the
-// SX1276 shifts a FIFO byte out in 
+// SX1278 shifts a FIFO byte out in 
 class BitWriter
 {
 public:
@@ -178,10 +178,10 @@ std::vector<uint8_t> buildWaveform(const std::array<uint8_t, 5>& data)
 }
 } // namespace
 
-void SX1276Driver::resetChip()
+void SX1278Driver::resetChip()
 {
     gpio_config_t resetConfig = {};
-    resetConfig.pin_bit_mask = 1ULL << SX1276_RESET_GPIO;
+    resetConfig.pin_bit_mask = 1ULL << SX1278_RESET_GPIO;
     resetConfig.mode = GPIO_MODE_OUTPUT;
     resetConfig.pull_up_en = GPIO_PULLUP_DISABLE;
     resetConfig.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -189,18 +189,18 @@ void SX1276Driver::resetChip()
     gpio_config(&resetConfig);
 
     // Manual reset per datasheet section 7.2.2: NRESET low for >100us, then wait >=5ms.
-    gpio_set_level(SX1276_RESET_GPIO, 0);
+    gpio_set_level(SX1278_RESET_GPIO, 0);
     esp_rom_delay_us(200);
-    gpio_set_level(SX1276_RESET_GPIO, 1);
+    gpio_set_level(SX1278_RESET_GPIO, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
-void SX1276Driver::configureDioPins()
+void SX1278Driver::configureDioPins()
 {
     // DIO0 = PacketSent, DIO1 = FifoLevel in Tx/packet mode -- both are the default DioMapping
     // (RegDioMapping1 reset value 0x00), so only the GPIO direction needs configuring here.
     gpio_config_t dioConfig = {};
-    dioConfig.pin_bit_mask = (1ULL << SX1276_DIO0_GPIO) | (1ULL << SX1276_DIO1_GPIO);
+    dioConfig.pin_bit_mask = (1ULL << SX1278_DIO0_GPIO) | (1ULL << SX1278_DIO1_GPIO);
     dioConfig.mode = GPIO_MODE_INPUT;
     dioConfig.pull_up_en = GPIO_PULLUP_DISABLE;
     dioConfig.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -213,7 +213,7 @@ void SX1276Driver::configureDioPins()
     // disabled since DIO2's meaning while transmitting/mid-configuration is undefined;
     // enterReceiveMode() is what turns it on.
     gpio_config_t dio2Config = {};
-    dio2Config.pin_bit_mask = 1ULL << SX1276_DIO2_GPIO;
+    dio2Config.pin_bit_mask = 1ULL << SX1278_DIO2_GPIO;
     dio2Config.mode = GPIO_MODE_INPUT;
     dio2Config.pull_up_en = GPIO_PULLUP_DISABLE;
     dio2Config.pull_down_en = GPIO_PULLDOWN_DISABLE;
@@ -228,16 +228,16 @@ void SX1276Driver::configureDioPins()
         ESP_LOGE(TAG, "Failed to install GPIO ISR service: %d", err);
         return;
     }
-    err = gpio_isr_handler_add(SX1276_DIO2_GPIO, &SX1276Driver::dio2IsrHandler, this);
+    err = gpio_isr_handler_add(SX1278_DIO2_GPIO, &SX1278Driver::dio2IsrHandler, this);
     if (err != ESP_OK)
     {
         ESP_LOGE(TAG, "Failed to add DIO2 ISR handler: %d", err);
         return;
     }
-    gpio_intr_disable(SX1276_DIO2_GPIO);
+    gpio_intr_disable(SX1278_DIO2_GPIO);
 }
 
-void SX1276Driver::writeRegister(uint8_t address, uint8_t value)
+void SX1278Driver::writeRegister(uint8_t address, uint8_t value)
 {
     uint8_t buffer[2] = { static_cast<uint8_t>(address | SPI_WRITE_BIT), value };
     spi_transaction_t transaction = {};
@@ -246,7 +246,7 @@ void SX1276Driver::writeRegister(uint8_t address, uint8_t value)
     spi_device_polling_transmit(this->spiDevice, &transaction);
 }
 
-uint8_t SX1276Driver::readRegister(uint8_t address)
+uint8_t SX1278Driver::readRegister(uint8_t address)
 {
     uint8_t tx[2] = { static_cast<uint8_t>(address & ~SPI_WRITE_BIT), 0x00 };
     uint8_t rx[2] = {};
@@ -258,7 +258,7 @@ uint8_t SX1276Driver::readRegister(uint8_t address)
     return rx[1];
 }
 
-void SX1276Driver::writeFifo(const uint8_t* data, size_t length)
+void SX1278Driver::writeFifo(const uint8_t* data, size_t length)
 {
     uint8_t buffer[FIFO_CHUNK + 1];
     buffer[0] = REG_FIFO | SPI_WRITE_BIT;
@@ -270,7 +270,7 @@ void SX1276Driver::writeFifo(const uint8_t* data, size_t length)
     spi_device_polling_transmit(this->spiDevice, &transaction);
 }
 
-void SX1276Driver::configureRadio()
+void SX1278Driver::configureRadio()
 {
     // LongRangeMode can only change while the *target* mode is Sleep, so force that first
     // regardless of whatever mode the chip happened to power up or warm-reset into.
@@ -306,7 +306,7 @@ void SX1276Driver::configureRadio()
 
 // One-time OOK receiver setup. These registers are independent of the Tx/Rx DataMode toggle in
 // enterReceiveMode()/transmitWaveform(), so they only need writing once.
-void SX1276Driver::configureReceiver()
+void SX1278Driver::configureReceiver()
 {
     // BitSyncOn=0, OokThreshType=01 (Peak, recommended default). BitSyncOn must be off: our
     // protocol has no 0x55/0xAA preamble for the bit synchronizer to lock onto, so leaving it on
@@ -328,8 +328,8 @@ void SX1276Driver::configureReceiver()
     // specific to this board/antenna/environment -- the datasheet's own recommended procedure
     // (section 2.1.3.2, "Optimizing the Floor Threshold") is to raise it until DIO2 stops
     // toggling with no transmitter active. This is only a conservative starting point (double
-    // the POR reset value); use the "sx1276reg" console command to tune it properly on this
-    // hardware without reflashing, e.g. `sx1276reg 0x15 0x20`.
+    // the POR reset value); use the "sx1278reg" console command to tune it properly on this
+    // hardware without reflashing, e.g. `sx1278reg 0x15 0x20`.
     writeRegister(REG_OOK_FIX, 0x18);
 
     // AgcAutoOn=1, RxTrigger=001 (Rssi interrupt): the LNA gain (re-)converges whenever RSSI
@@ -338,7 +338,7 @@ void SX1276Driver::configureReceiver()
     writeRegister(REG_RX_CONFIG, 0x09);
 }
 
-void SX1276Driver::init()
+void SX1278Driver::init()
 {
     resetChip();
     configureDioPins();
@@ -359,39 +359,39 @@ void SX1276Driver::init()
     spi_device_interface_config_t devConfig = {};
     devConfig.clock_speed_hz = SPI_CLOCK_HZ;
     devConfig.mode = 0; // CPOL=0, CPHA=0
-    devConfig.spics_io_num = SX1276_NSS_GPIO;
+    devConfig.spics_io_num = SX1278_NSS_GPIO;
     devConfig.queue_size = 1;
     err = spi_bus_add_device(VSPI_HOST, &devConfig, &this->spiDevice);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to add SX1276 as a SPI device: %d", err);
+        ESP_LOGE(TAG, "Failed to add SX1278 as a SPI device: %d", err);
         return;
     }
 
     uint8_t version = readRegister(REG_VERSION);
-    ESP_LOGI(TAG, "SX1276 RegVersion=0x%02X", version);
+    ESP_LOGI(TAG, "SX1278 RegVersion=0x%02X", version);
     if (version == 0x00 || version == 0xFF)
     {
-        ESP_LOGE(TAG, "SX1276 not responding on SPI, aborting init");
+        ESP_LOGE(TAG, "SX1278 not responding on SPI, aborting init");
         this->spiDevice = nullptr;
         return;
     }
 
     configureRadio();
     configureReceiver();
-    ESP_LOGI(TAG, "SX1276 initialised");
+    ESP_LOGI(TAG, "SX1278 initialised");
 
     this->commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(QueuedCommand));
     this->rxFrameQueue = xQueueCreate(RX_FRAME_QUEUE_LENGTH, sizeof(std::array<uint8_t, 5>));
-    xTaskCreate(&SX1276Driver::receiverTask, "sx1276_receiver", RECEIVER_TASK_STACK_WORDS, this,
+    xTaskCreate(&SX1278Driver::receiverTask, "sx1278_receiver", RECEIVER_TASK_STACK_WORDS, this,
                 RECEIVER_TASK_PRIORITY, &this->receiverTaskHandle);
-    xTaskCreate(&SX1276Driver::senderTask, "sx1276_sender", SENDER_TASK_STACK_WORDS, this, SENDER_TASK_PRIORITY,
+    xTaskCreate(&SX1278Driver::senderTask, "sx1278_sender", SENDER_TASK_STACK_WORDS, this, SENDER_TASK_PRIORITY,
                 &this->senderTaskHandle);
 }
 
 // Switches the radio into continuous OOK receive mode and (re-)arms the DIO2 interrupt, ready to
 // decode the next frame from scratch. Called once at startup and again after every transmission.
-void SX1276Driver::enterReceiveMode()
+void SX1278Driver::enterReceiveMode()
 {
     writeRegister(REG_PACKET_CONFIG2, PACKET_CONFIG2_DATA_MODE_CONTINUOUS);
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);
@@ -401,15 +401,15 @@ void SX1276Driver::enterReceiveMode()
     this->rxState = RxState{};
     portEXIT_CRITICAL(&this->rxStateMux);
 
-    gpio_intr_enable(SX1276_DIO2_GPIO);
+    gpio_intr_enable(SX1278_DIO2_GPIO);
 }
 
-void SX1276Driver::setReceiveCallback(ReceiveCallback callback)
+void SX1278Driver::setReceiveCallback(ReceiveCallback callback)
 {
     this->receiveCallback = std::move(callback);
 }
 
-bool SX1276Driver::peekRegister(uint8_t address, uint8_t& outValue)
+bool SX1278Driver::peekRegister(uint8_t address, uint8_t& outValue)
 {
     if (this->spiDevice == nullptr)
     {
@@ -419,7 +419,7 @@ bool SX1276Driver::peekRegister(uint8_t address, uint8_t& outValue)
     return true;
 }
 
-bool SX1276Driver::pokeRegister(uint8_t address, uint8_t value)
+bool SX1278Driver::pokeRegister(uint8_t address, uint8_t value)
 {
     if (this->spiDevice == nullptr)
     {
@@ -429,7 +429,7 @@ bool SX1276Driver::pokeRegister(uint8_t address, uint8_t value)
     return true;
 }
 
-bool SX1276Driver::peekRssiDbm(double& outDbm)
+bool SX1278Driver::peekRssiDbm(double& outDbm)
 {
     uint8_t rssiValue = 0;
     if (!peekRegister(REG_RSSI_VALUE, rssiValue))
@@ -444,9 +444,9 @@ bool SX1276Driver::peekRssiDbm(double& outDbm)
 // handleReceivedEdge() finishes decoding. Kept off the ISR entirely: the callback ultimately
 // reaches BlindController (mutexes) and esp_matter (attribute updates), neither of which is
 // ISR-safe.
-void SX1276Driver::receiverTask(void* arg)
+void SX1278Driver::receiverTask(void* arg)
 {
-    auto* self = static_cast<SX1276Driver*>(arg);
+    auto* self = static_cast<SX1278Driver*>(arg);
     std::array<uint8_t, 5> frame;
     while (true)
     {
@@ -457,11 +457,11 @@ void SX1276Driver::receiverTask(void* arg)
     }
 }
 
-void IRAM_ATTR SX1276Driver::dio2IsrHandler(void* arg)
+void IRAM_ATTR SX1278Driver::dio2IsrHandler(void* arg)
 {
-    auto* self = static_cast<SX1276Driver*>(arg);
+    auto* self = static_cast<SX1278Driver*>(arg);
     int64_t now = esp_timer_get_time();
-    int level = gpio_get_level(SX1276_DIO2_GPIO);
+    int level = gpio_get_level(SX1278_DIO2_GPIO);
     self->handleReceivedEdge(now, level);
 }
 
@@ -475,7 +475,7 @@ void IRAM_ATTR SX1276Driver::dio2IsrHandler(void* arg)
 // above). Anything that doesn't fit an expected width abandons the in-progress frame and waits
 // for the next sync pulse, so a corrupted/partial reception self-heals on the next button-press
 // repeat instead of needing an explicit timeout.
-void IRAM_ATTR SX1276Driver::handleReceivedEdge(int64_t nowUs, int level)
+void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
 {
     bool frameComplete = false;
     std::array<uint8_t, 5> completedFrame{};
@@ -565,9 +565,9 @@ void IRAM_ATTR SX1276Driver::handleReceivedEdge(int64_t nowUs, int level)
 // submission order so callers never wait on air time. Whenever it isn't actively transmitting,
 // it leaves the radio in continuous receive mode listening for the physical remote (see
 // enterReceiveMode()).
-void SX1276Driver::senderTask(void* arg)
+void SX1278Driver::senderTask(void* arg)
 {
-    auto* self = static_cast<SX1276Driver*>(arg);
+    auto* self = static_cast<SX1278Driver*>(arg);
     self->enterReceiveMode();
     QueuedCommand command;
     while (true)
@@ -581,12 +581,12 @@ void SX1276Driver::senderTask(void* arg)
     }
 }
 
-void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
+void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
 {
     // Stop reacting to DIO2 edges and drop out of continuous Rx mode (the sender task may be
     // calling this while the radio is still listening) before touching any packet-framing
     // registers below.
-    gpio_intr_disable(SX1276_DIO2_GPIO);
+    gpio_intr_disable(SX1278_DIO2_GPIO);
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);
 
     size_t total = waveform.size();
@@ -609,7 +609,7 @@ void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
     int64_t deadline = esp_timer_get_time() + FIFO_WAIT_TIMEOUT_US;
     while (sent < total)
     {
-        if (gpio_get_level(SX1276_DIO1_GPIO) == 0) // FifoLevel cleared: level has drained to the threshold
+        if (gpio_get_level(SX1278_DIO1_GPIO) == 0) // FifoLevel cleared: level has drained to the threshold
         {
             size_t chunk = std::min(total - sent, FIFO_CHUNK);
             writeFifo(waveform.data() + sent, chunk);
@@ -618,18 +618,18 @@ void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
         }
         else if (esp_timer_get_time() > deadline)
         {
-            ESP_LOGE(TAG, "Timed out refilling SX1276 FIFO, aborting transmission");
+            ESP_LOGE(TAG, "Timed out refilling SX1278 FIFO, aborting transmission");
             writeRegister(REG_OP_MODE, OPMODE_STANDBY);
             return;
         }
     }
 
     deadline = esp_timer_get_time() + FIFO_WAIT_TIMEOUT_US;
-    while (gpio_get_level(SX1276_DIO0_GPIO) == 0) // PacketSent
+    while (gpio_get_level(SX1278_DIO0_GPIO) == 0) // PacketSent
     {
         if (esp_timer_get_time() > deadline)
         {
-            ESP_LOGE(TAG, "Timed out waiting for SX1276 PacketSent");
+            ESP_LOGE(TAG, "Timed out waiting for SX1278 PacketSent");
             break;
         }
     }
@@ -637,25 +637,25 @@ void SX1276Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);
 }
 
-void SX1276Driver::send(const std::array<uint8_t, 5>& data, uint8_t repeats)
+void SX1278Driver::send(const std::array<uint8_t, 5>& data, uint8_t repeats)
 {
     if (this->commandQueue == nullptr)
     {
-        ESP_LOGE(TAG, "SX1276 not initialised, dropping command");
+        ESP_LOGE(TAG, "SX1278 not initialised, dropping command");
         return;
     }
 
     QueuedCommand command{ data, repeats };
     if (xQueueSend(this->commandQueue, &command, 0) != pdTRUE)
     {
-        ESP_LOGE(TAG, "SX1276 command queue full, dropping command %02X %02X %02X %02X %02X",
+        ESP_LOGE(TAG, "SX1278 command queue full, dropping command %02X %02X %02X %02X %02X",
                  data[0], data[1], data[2], data[3], data[4]);
     }
 }
 
 // Runs on senderTask. Actually keys the radio and streams the waveform out over SPI; blocks for
 // the duration of the transmission (including inter-repeat gaps).
-void SX1276Driver::sendNow(const std::array<uint8_t, 5>& data, uint8_t repeats)
+void SX1278Driver::sendNow(const std::array<uint8_t, 5>& data, uint8_t repeats)
 {
     ESP_LOGI(TAG, "Sending %02X %02X %02X %02X %02X, repeats=%d",
              data[0], data[1], data[2], data[3], data[4], repeats);

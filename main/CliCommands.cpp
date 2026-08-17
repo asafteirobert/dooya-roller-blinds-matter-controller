@@ -13,16 +13,16 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
-#include "SX1276Driver.hpp"
+#include "SX1278Driver.hpp"
 
 namespace
 {
 constexpr char* TAG = "CliCommands";
 
-// ── sx1276reg: peek/poke a raw SX1276 register, for interactively tuning RF settings without
+// ── sx1278reg: peek/poke a raw SX1278 register, for interactively tuning RF settings without
 // reflashing -- primarily RegOokFix (0x15), per the datasheet's own recommended procedure for
 // finding the OOK floor threshold that rejects ambient noise on this specific board/antenna
-// (see configureReceiver() in SX1276Driver.cpp). Avoid using this while a blind is moving: pokes
+// (see configureReceiver() in SX1278Driver.cpp). Avoid using this while a blind is moving: pokes
 // go through the same SPI device senderTask uses, and while individual register transactions are
 // serialized safely, interleaving a poke with the middle of a transmission can still corrupt it.
 struct RegArgs
@@ -48,7 +48,7 @@ bool parseByte(const char* text, uint8_t& outValue)
 
 int handleRegCommand(void* context, int argc, char** argv)
 {
-    auto* driver = static_cast<SX1276Driver*>(context);
+    auto* driver = static_cast<SX1278Driver*>(context);
 
     int errors = arg_parse(argc, argv, reinterpret_cast<void**>(&regArgs));
     if (errors != 0)
@@ -74,7 +74,7 @@ int handleRegCommand(void* context, int argc, char** argv)
         }
         if (!driver->pokeRegister(address, value))
         {
-            printf("SX1276 not initialised\n");
+            printf("SX1278 not initialised\n");
             return 1;
         }
     }
@@ -82,17 +82,17 @@ int handleRegCommand(void* context, int argc, char** argv)
     uint8_t readBack = 0;
     if (!driver->peekRegister(address, readBack))
     {
-        printf("SX1276 not initialised\n");
+        printf("SX1278 not initialised\n");
         return 1;
     }
     printf("reg 0x%02X = 0x%02X\n", address, readBack);
     return 0;
 }
 
-// ── sx1276rssi: streams instantaneous RSSI (dBm) while the radio idles in receive mode. Useful
+// ── sx1278rssi: streams instantaneous RSSI (dBm) while the radio idles in receive mode. Useful
 // for empirically separating the ambient noise floor from the remote's actual signal strength --
 // watch it while walking the remote away from the receiver, or while raising RegOokFix with
-// sx1276reg until it settles instead of chattering with no transmitter active.
+// sx1278reg until it settles instead of chattering with no transmitter active.
 struct RssiArgs
 {
     arg_int* count;
@@ -102,7 +102,7 @@ struct RssiArgs
 
 int handleRssiCommand(void* context, int argc, char** argv)
 {
-    auto* driver = static_cast<SX1276Driver*>(context);
+    auto* driver = static_cast<SX1278Driver*>(context);
 
     int errors = arg_parse(argc, argv, reinterpret_cast<void**>(&rssiArgs));
     if (errors != 0)
@@ -117,7 +117,7 @@ int handleRssiCommand(void* context, int argc, char** argv)
     {
         count = 1;
     }
-    if (count > 50) // keep an accidental "sx1276rssi -n 100000" from hanging the console
+    if (count > 50) // keep an accidental "sx1278rssi -n 100000" from hanging the console
     {
         count = 50;
     }
@@ -131,7 +131,7 @@ int handleRssiCommand(void* context, int argc, char** argv)
         double dbm = 0.0;
         if (!driver->peekRssiDbm(dbm))
         {
-            printf("SX1276 not initialised\n");
+            printf("SX1278 not initialised\n");
             return 1;
         }
         printf("RSSI: %.1f dBm\n", dbm);
@@ -146,42 +146,42 @@ int handleRssiCommand(void* context, int argc, char** argv)
 
 // ── public entry point ───────────────────────────────────────────────────────
 
-void cli_register_commands(SX1276Driver& sx1276Driver)
+void cli_register_commands(SX1278Driver& sx1278Driver)
 {
     regArgs.address = arg_str1(nullptr, nullptr, "<address>", "register address, e.g. 0x15");
     regArgs.value = arg_str0(nullptr, nullptr, "<value>", "value to write, e.g. 0x20 (omit to just read)");
     regArgs.end = arg_end(2);
     const esp_console_cmd_t regCmd = {
-        .command = "sx1276reg",
-        .help = "Read (and optionally write) a raw SX1276 register",
+        .command = "sx1278reg",
+        .help = "Read (and optionally write) a raw SX1278 register",
         .hint = nullptr,
         .func = nullptr,
         .argtable = &regArgs,
         .func_w_context = &handleRegCommand,
-        .context = &sx1276Driver,
+        .context = &sx1278Driver,
     };
     esp_err_t err = esp_console_cmd_register(&regCmd);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to register sx1276reg command: %d", err);
+        ESP_LOGE(TAG, "Failed to register sx1278reg command: %d", err);
     }
 
     rssiArgs.count = arg_int0("n", nullptr, "<count>", "number of samples to print (default 1, max 50)");
     rssiArgs.interval_ms = arg_int0("d", nullptr, "<ms>", "delay between samples in ms (default 500)");
     rssiArgs.end = arg_end(2);
     const esp_console_cmd_t rssiCmd = {
-        .command = "sx1276rssi",
-        .help = "Print the SX1276's instantaneous RSSI while idling in receive mode",
+        .command = "sx1278rssi",
+        .help = "Print the SX1278's instantaneous RSSI while idling in receive mode",
         .hint = nullptr,
         .func = nullptr,
         .argtable = &rssiArgs,
         .func_w_context = &handleRssiCommand,
-        .context = &sx1276Driver,
+        .context = &sx1278Driver,
     };
     err = esp_console_cmd_register(&rssiCmd);
     if (err != ESP_OK)
     {
-        ESP_LOGE(TAG, "Failed to register sx1276rssi command: %d", err);
+        ESP_LOGE(TAG, "Failed to register sx1278rssi command: %d", err);
     }
 }
 

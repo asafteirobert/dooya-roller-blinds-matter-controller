@@ -31,7 +31,7 @@
 #include "BlindController.hpp"
 #include "CliCommands.hpp"
 #include "RadioController.hpp"
-#include "SX1276Driver.hpp"
+#include "SX1278Driver.hpp"
 
 #ifdef CONFIG_ENABLE_SET_CERT_DECLARATION_API
 #include <esp_matter_providers.h>
@@ -52,9 +52,9 @@ static const char *TAG = "app_main";
 
 ButtonDriver buttonDriver;
 RadioController radioController;
-SX1276Driver sx1276Driver;
+SX1278Driver sx1278Driver;
 
-// One BlindController per configured blind. RadioController/SX1276Driver stay singletons: they
+// One BlindController per configured blind. RadioController/SX1278Driver stay singletons: they
 // are the shared radio, addressed per-command by remoteId+channel, so only per-blind motion
 // state needs multiple instances.
 BlindController blindControllers[MAX_BLINDS];
@@ -375,8 +375,8 @@ extern "C" void app_main()
     // Initialize the shared radio once; each blind's BlindController below gets its own init()
     // call inside the loop, but they all drive commands through this same radioController.
     buttonDriver.init();
-    sx1276Driver.init();
-    radioController.init(sx1276Driver);
+    sx1278Driver.init();
+    radioController.init(sx1278Driver);
 
     for (uint8_t i = 0; i < numBlinds; ++i)
     {
@@ -528,7 +528,7 @@ extern "C" void app_main()
 #if CONFIG_OPENTHREAD_CLI
     esp_matter::console::otcli_register_commands();
 #endif
-    cli_register_commands(sx1276Driver);
+    cli_register_commands(sx1278Driver);
     esp_matter::console::init();
 #endif
 
