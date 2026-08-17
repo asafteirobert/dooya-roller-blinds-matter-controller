@@ -63,13 +63,22 @@ constexpr UBaseType_t RECEIVER_TASK_PRIORITY = 5;
 // --- OOK/PWM RX decode tolerances, mirroring buildWaveform()'s encoding in reverse. Only the
 // duration of each HIGH ("mark") run is used to decode a bit -- LONG_US means 1, SHORT_US means
 // 0 -- since buildWaveform() always pairs a mark with the complementary-length space to keep the
-// bit period constant, so the space carries no extra information. Windows are wide (roughly
-// +/-50%) to tolerate the RC transmitter/receiver's timing jitter without overlapping.
-constexpr int64_t RX_SHORT_MIN_US = 150;
-constexpr int64_t RX_SHORT_MAX_US = 525; // midpoint between SHORT_US and LONG_US
-constexpr int64_t RX_LONG_MAX_US = 1200; // comfortably below RX_SYNC_MIN_US
-constexpr int64_t RX_SYNC_MIN_US = 2500; // comfortably above RX_LONG_MAX_US
-constexpr int64_t RX_SYNC_MAX_US = 6500; // comfortably above SYNC_US
+// bit period constant, so the space carries no extra information.
+//
+// Every classification band below is separated from its neighbours by a dead zone that belongs to
+// neither: a duration landing in a gap aborts the in-progress frame (see handleReceivedEdge)
+// instead of being forced into whichever band happens to be closest. Without that gap, jitter that
+// pushes a single mark across a boundary silently flips that bit instead of dropping the frame --
+// this is what let corrupted-but-well-formed frames (right length, wrong bit) through and produced
+// commands with a plausible-looking but wrong remote ID. A dropped frame is harmless: the remote
+// repeats every button press several times and RadioController only needs one good frame to get
+// through.
+constexpr int64_t RX_SHORT_MIN_US = 180;
+constexpr int64_t RX_SHORT_MAX_US = 460; // SHORT_US(350) + ~31%
+constexpr int64_t RX_LONG_MIN_US = 590;  // LONG_US(700) - ~16% -- 130us dead zone vs RX_SHORT_MAX_US
+constexpr int64_t RX_LONG_MAX_US = 1000; // LONG_US(700) + ~43%, comfortably below RX_SYNC_MIN_US
+constexpr int64_t RX_SYNC_MIN_US = 2800; // SYNC_US(4600) - ~39%, comfortably above RX_LONG_MAX_US
+constexpr int64_t RX_SYNC_MAX_US = 6200; // SYNC_US(4600) + ~35%
 constexpr uint8_t RX_FRAME_BITS = 40;
 
 // The sync mark is always followed by a fixed 2*LONG_US (1400us) low gap before the first bit's
@@ -77,8 +86,8 @@ constexpr uint8_t RX_FRAME_BITS = 40;
 // "in frame" makes a random noise glitch that happens to land in the SYNC_US window (rare on its
 // own) need a *second* coincidence to be mistaken for a real frame, which is what lets a weak
 // real signal be told apart from noise reliably instead of just by luck.
-constexpr int64_t RX_POST_SYNC_GAP_MIN_US = 900;
-constexpr int64_t RX_POST_SYNC_GAP_MAX_US = 2100;
+constexpr int64_t RX_POST_SYNC_GAP_MIN_US = 1050;
+constexpr int64_t RX_POST_SYNC_GAP_MAX_US = 1850;
 
 // --- SX1278 FSK/OOK register map (see RFM9x/SX1278 datasheet section 6.2) ---
 constexpr uint8_t REG_FIFO = 0x00;
@@ -499,12 +508,15 @@ void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
             {
                 bit = false;
             }
-            else if (durationUs > RX_SHORT_MAX_US && durationUs <= RX_LONG_MAX_US)
+            else if (durationUs >= RX_LONG_MIN_US && durationUs <= RX_LONG_MAX_US)
             {
                 bit = true;
             }
             else
             {
+                // Falls in a dead zone (or wildly out of range): too ambiguous to guess at, so
+                // abandon this frame rather than risk committing a wrong bit. Self-heals on the
+                // next sync pulse -- either a repeat of the same button press or the next one.
                 haveBit = false;
                 this->rxState.phase = RxState::Phase::Idle;
             }
