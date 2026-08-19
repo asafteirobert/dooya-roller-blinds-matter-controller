@@ -1,4 +1,5 @@
 {
+  "C_Cpp.intelliSenseEngine": "disabled",
   "idf.currentSetup": "/home/robert/.espressif/v5.5.5/esp-idf",
   "idf.openOcdConfigs": [
     "interface/ftdi/esp_ftdi.cfg",
