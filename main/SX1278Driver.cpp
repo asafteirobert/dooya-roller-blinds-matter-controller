@@ -13,6 +13,7 @@
 #include <esp_rom_sys.h>
 #include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 #include <freertos/task.h>
 
 namespace
@@ -68,6 +69,31 @@ constexpr uint32_t COMMAND_GAP_MS = 200;
 constexpr UBaseType_t RX_FRAME_QUEUE_LENGTH = 8;
 constexpr uint32_t RECEIVER_TASK_STACK_WORDS = 4096;
 constexpr UBaseType_t RECEIVER_TASK_PRIORITY = 5;
+
+// dio2SetupTask() runs configureEdgeCounter()/configureDioPins() from core 1 instead of directly
+// from init() (core 0), so the MCPWM capture and PCNT interrupts esp_intr_alloc() registers inside
+// those calls bind to core 1 -- away from WiFi/BLE's own interrupt dispatch, both pinned to core 0
+// (see the comment in configureDioPins() this was written to address).
+constexpr uint32_t DIO2_SETUP_TASK_STACK_WORDS = 3072;
+constexpr UBaseType_t DIO2_SETUP_TASK_PRIORITY = 5;
+constexpr BaseType_t DIO2_SETUP_CORE = 1;
+
+// Passed into dio2SetupTask() as its FreeRTOS task argument.
+struct Dio2SetupContext
+{
+    SX1278Driver* driver;
+    SemaphoreHandle_t doneSemaphore;
+};
+
+// ESP32's PCNT counter register is a signed 16-bit field.
+constexpr int PCNT_LOW_LIMIT = -32768;
+constexpr int PCNT_HIGH_LIMIT = 32767;
+// One decoded frame is ~82 edges (sync + post-sync gap + 40 bits x mark/space, see buildWaveform()).
+// 20000 leaves >12000 edges of headroom below the hardware ceiling -- at the worst-case edge rate the
+// noise filter allows (RX_NOISE_MAX_US=50us minimum spacing => <=20000 edges/sec), that's >0.6s for
+// onPcntWatchPoint() -- which has the same single-pending-bit ISR limitation as MCPWM capture -- to
+// actually get serviced before the hardware register itself could wrap.
+constexpr int PCNT_WATCH_POINT = 20000;
 
 // --- OOK/PWM RX decode tolerances, mirroring buildWaveform()'s encoding in reverse. Only the
 // duration of each HIGH ("mark") run is used to decode a bit -- LONG_US means 1, SHORT_US means
@@ -220,6 +246,83 @@ void SX1278Driver::resetChip()
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
+// Sets up the PCNT ground-truth edge counter for DIO2 -- see the header comment on rxEdgeCountUnit.
+// Must run before configureDioPins(): pcnt_new_channel() unconditionally force-enables DIO2's
+// internal pull-up (its own doc comment: "input mode with pull up enabled"), and configureDioPins()'s
+// mcpwm_new_capture_channel() call explicitly disables it again (pull_up=false, matching
+// GPIO_PULLUP_DISABLE elsewhere) -- so that disable must be the one that runs last.
+void SX1278Driver::configureEdgeCounter()
+{
+    pcnt_unit_config_t unitConfig = {};
+    unitConfig.low_limit = PCNT_LOW_LIMIT;
+    unitConfig.high_limit = PCNT_HIGH_LIMIT;
+    unitConfig.intr_priority = 3; // same reasoning as capChanConfig.intr_priority below
+    esp_err_t err = pcnt_new_unit(&unitConfig, &this->rxEdgeCountUnit);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to create DIO2 edge-count PCNT unit: %d", err);
+        return;
+    }
+
+    // No glitch filter: this counter must match MCPWM capture's raw per-ISR-call count 1:1,
+    // including the noise glitches handleReceivedEdge()'s own buffering later filters out.
+    pcnt_chan_config_t chanConfig = {};
+    chanConfig.edge_gpio_num = SX1278_DIO2_GPIO;
+    chanConfig.level_gpio_num = -1;
+    err = pcnt_new_channel(this->rxEdgeCountUnit, &chanConfig, &this->rxEdgeCountChannel);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to create DIO2 edge-count PCNT channel: %d", err);
+        return;
+    }
+
+    // Count both edges, matching flags.pos_edge/neg_edge in configureDioPins()'s capture channel.
+    pcnt_channel_set_edge_action(this->rxEdgeCountChannel, PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+                                  PCNT_CHANNEL_EDGE_ACTION_INCREASE);
+    pcnt_channel_set_level_action(this->rxEdgeCountChannel, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+                                   PCNT_CHANNEL_LEVEL_ACTION_KEEP);
+
+    err = pcnt_unit_add_watch_point(this->rxEdgeCountUnit, PCNT_WATCH_POINT);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to add DIO2 edge-count watch point: %d", err);
+        return;
+    }
+
+    pcnt_event_callbacks_t pcntCallbacks = { .on_reach = &SX1278Driver::onPcntWatchPoint };
+    err = pcnt_unit_register_event_callbacks(this->rxEdgeCountUnit, &pcntCallbacks, this);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to register DIO2 edge-count watch point callback: %d", err);
+        return;
+    }
+
+    err = pcnt_unit_enable(this->rxEdgeCountUnit);
+    if (err != ESP_OK)
+    {
+        ESP_LOGE(TAG, "Failed to enable DIO2 edge-count PCNT unit: %d", err);
+        return;
+    }
+    pcnt_unit_clear_count(this->rxEdgeCountUnit);
+    // Deliberately not calling pcnt_unit_start() here -- enterReceiveMode()/transmitWaveform() start
+    // and stop it in lockstep with the MCPWM capture channel, same pattern as
+    // mcpwm_capture_channel_enable()/disable().
+}
+
+// Runs configureEdgeCounter()/configureDioPins() from a task pinned to core 1 instead of directly
+// from init() (which runs on core 0, see app_main.cpp), so the interrupts esp_intr_alloc() registers
+// inside those two calls bind to core 1 instead of contending with WiFi/BLE's own interrupt dispatch
+// on core 0 -- see the DIO2_SETUP_* comment above. init() blocks on doneSemaphore so it stays
+// synchronous from its caller's perspective; this task deletes itself once done.
+void SX1278Driver::dio2SetupTask(void* arg)
+{
+    auto* context = static_cast<Dio2SetupContext*>(arg);
+    context->driver->configureEdgeCounter();
+    context->driver->configureDioPins();
+    xSemaphoreGive(context->doneSemaphore);
+    vTaskDelete(nullptr);
+}
+
 void SX1278Driver::configureDioPins()
 {
     // DIO0 = PacketSent, DIO1 = FifoLevel in Tx/packet mode -- both are the default DioMapping
@@ -268,6 +371,7 @@ void SX1278Driver::configureDioPins()
 
     mcpwm_capture_channel_config_t capChanConfig = {};
     capChanConfig.gpio_num = SX1278_DIO2_GPIO;
+    capChanConfig.intr_priority = 3; // max level MCPWM capture can ever get -- see dio2SetupTask()
     capChanConfig.prescale = 1;
     capChanConfig.flags.pos_edge = true;
     capChanConfig.flags.neg_edge = true;
@@ -418,7 +522,17 @@ void SX1278Driver::configureReceiver()
 void SX1278Driver::init()
 {
     resetChip();
-    configureDioPins();
+
+    // See dio2SetupTask()'s comment: runs configureEdgeCounter()/configureDioPins() from core 1 so
+    // their interrupts bind there instead of core 0. This blocks until that task signals completion,
+    // so init() remains synchronous from app_main.cpp's perspective.
+    SemaphoreHandle_t dio2SetupDone = xSemaphoreCreateBinary();
+    Dio2SetupContext dio2SetupContext{ this, dio2SetupDone };
+    xTaskCreatePinnedToCore(&SX1278Driver::dio2SetupTask, "sx1278_dio2_setup", DIO2_SETUP_TASK_STACK_WORDS,
+                             &dio2SetupContext, DIO2_SETUP_TASK_PRIORITY, nullptr, DIO2_SETUP_CORE);
+    xSemaphoreTake(dio2SetupDone, portMAX_DELAY);
+    vSemaphoreDelete(dio2SetupDone);
+
     configureDebugPins();
 
     spi_bus_config_t busConfig = {};
@@ -489,12 +603,26 @@ void SX1278Driver::enterReceiveMode()
     portENTER_CRITICAL(&this->rxStateMux);
     this->rxState = RxState{};
     this->rxPendingValid = false;
+    if (this->rxEdgeCountUnit != nullptr)
+    {
+        pcnt_unit_clear_count(this->rxEdgeCountUnit);
+    }
+    this->rxIsrEdgeCount = 0;
     portEXIT_CRITICAL(&this->rxStateMux);
 
     esp_err_t err = mcpwm_capture_channel_enable(this->rxCaptureChannel);
     if (err != ESP_OK)
     {
         ESP_LOGW(TAG, "Failed to enable DIO2 capture channel: %d", err);
+    }
+
+    if (this->rxEdgeCountUnit != nullptr)
+    {
+        err = pcnt_unit_start(this->rxEdgeCountUnit);
+        if (err != ESP_OK)
+        {
+            ESP_LOGW(TAG, "Failed to start DIO2 edge-count PCNT unit: %d", err);
+        }
     }
 }
 
@@ -705,6 +833,11 @@ void IRAM_ATTR SX1278Driver::logRxEvent(const RxEvent& event)
                       static_cast<unsigned>(event.bitCount), static_cast<long long>(event.durationUs),
                       static_cast<long long>(RX_NOISE_MAX_US));
         break;
+    case RxEvent::Kind::HardwareEdgeDropped:
+        ESP_DRAM_LOGW(ISR_LOG_TAG,
+                      "RX: MCPWM capture missed %lld DIO2 edge(s) at bit %u, dropped frame and resynced to PCNT",
+                      static_cast<long long>(event.durationUs), static_cast<unsigned>(event.bitCount));
+        break;
     case RxEvent::Kind::None:
         break;
     }
@@ -735,6 +868,26 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
     RxEvent rxEvent{};
 
     portENTER_CRITICAL_ISR(&this->rxStateMux);
+
+    ++this->rxIsrEdgeCount;
+    if (this->rxEdgeCountUnit != nullptr)
+    {
+        int pcntCount = 0;
+        pcnt_unit_get_count(this->rxEdgeCountUnit, &pcntCount);
+        if (pcntCount != this->rxIsrEdgeCount)
+        {
+            // MCPWM capture never fired for at least one real DIO2 edge (see configureEdgeCounter()).
+            // Whatever is buffered in rxPendingValid straddles the gap -- its duration was measured
+            // against a stale reference point, so discard it and abandon any in-progress frame instead
+            // of letting a corrupted duration reach applyEdgeToState(); decoding resyncs cleanly on
+            // the next sync pulse, same as the BitInvalid/GapInvalid paths there.
+            rxEvent = { RxEvent::Kind::HardwareEdgeDropped, pcntCount - this->rxIsrEdgeCount, this->rxState.bitCount };
+            this->rxState.phase = RxState::Phase::Idle;
+            this->rxPendingValid = false;
+            esp_timer_stop(this->rxNoiseTimer);
+            this->rxIsrEdgeCount = pcntCount; // re-baseline to hardware ground truth
+        }
+    }
 
     // Wraparound-safe unsigned subtraction on raw ticks, converted to microseconds only after
     // subtracting -- see the comment on rxCaptureTicksPerUs in the header and in applyEdgeToState().
@@ -798,6 +951,38 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
         higherPriorityTaskWoken = (woken == pdTRUE);
     }
     return higherPriorityTaskWoken;
+}
+
+// Fires (rarely -- every PCNT_WATCH_POINT edges) when the PCNT ground-truth counter reaches its
+// watch point, well before it could ever wrap its 16-bit hardware register. Reconciles it against
+// rxIsrEdgeCount one last time, then resets both back to zero together so the per-edge compare in
+// handleReceivedEdge() can keep comparing small numbers indefinitely. Both resets happen inside the
+// same rxStateMux critical section as that per-edge compare, so it can never observe one counter
+// freshly cleared while the other is still at its old ~PCNT_WATCH_POINT value -- which would
+// otherwise read as a huge spurious divergence and force an unnecessary resync.
+bool IRAM_ATTR SX1278Driver::onPcntWatchPoint(pcnt_unit_handle_t /*unit*/, const pcnt_watch_event_data_t* edata,
+                                               void* userCtx)
+{
+    auto* self = static_cast<SX1278Driver*>(userCtx);
+    RxEvent rxEvent{};
+
+    portENTER_CRITICAL_ISR(&self->rxStateMux);
+    int32_t delta = edata->watch_point_value - self->rxIsrEdgeCount;
+    if (delta != 0)
+    {
+        rxEvent = { RxEvent::Kind::HardwareEdgeDropped, delta, self->rxState.bitCount };
+        self->rxState.phase = RxState::Phase::Idle;
+        self->rxPendingValid = false;
+    }
+    pcnt_unit_clear_count(self->rxEdgeCountUnit);
+    self->rxIsrEdgeCount = 0;
+    portEXIT_CRITICAL_ISR(&self->rxStateMux);
+
+    if (rxEvent.kind != RxEvent::Kind::None)
+    {
+        logRxEvent(rxEvent);
+    }
+    return false;
 }
 
 // Runs on the esp_timer task, RX_NOISE_MAX_US after the last edge handleReceivedEdge() buffered,

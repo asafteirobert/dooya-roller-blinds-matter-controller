@@ -15,6 +15,12 @@
 // typedef with no tag name, so it can't be forward-declared and this can't be deferred to the .cpp.
 #include <driver/mcpwm_types.h>
 
+// Also lightweight (stdint/stdbool/esp_err.h/hal/pcnt_types.h only) -- unlike MCPWM, PCNT doesn't
+// split its handle typedefs into a separate types-only header from its function declarations, but
+// pcnt_watch_event_data_t is the same kind of anonymous-struct-typedef the callback signature
+// needs by value, so this can't be deferred to the .cpp either.
+#include <driver/pulse_cnt.h>
+
 // Avoids pulling driver/spi_master.h (and its transitive ESP-IDF includes) into every file that
 // includes this header; spi_device_handle_t is just a pointer to this struct.
 struct spi_device_t;
@@ -91,13 +97,21 @@ private:
             SyncAbortedFrame, // ...and it interrupted an already in-progress frame, dropping it
             GapInvalid,       // the post-sync low gap didn't match, dropped before any bits
             BitInvalid,       // a mark matched neither the short nor long band, dropped mid-frame
+            HardwareEdgeDropped, // the PCNT ground-truth edge counter diverged from the MCPWM-capture-
+                                  // driven count -- MCPWM's single-latch channel coalesced >=1 real
+                                  // DIO2 edges into one ISR call (see configureEdgeCounter()); whatever
+                                  // was in flight is abandoned and decoding resyncs on the next sync pulse
         };
         Kind kind = Kind::None;
+        // For every other Kind this is a duration in microseconds; for HardwareEdgeDropped it's
+        // repurposed as the raw edge-count delta (PCNT count minus software count) instead.
         int64_t durationUs = 0;
         uint8_t bitCount = 0; // bits collected so far, for GlitchDropped/AbortedFrame/BitInvalid
     };
 
     void resetChip();
+    static void dio2SetupTask(void* arg);
+    void configureEdgeCounter();
     void configureDioPins();
     void configureDebugPins();
     void configureRadio();
@@ -114,6 +128,7 @@ private:
     static void receiverTask(void* arg);
     static bool onDio2Capture(mcpwm_cap_channel_handle_t capChannel, const mcpwm_capture_event_data_t* edata,
                                void* userCtx);
+    static bool onPcntWatchPoint(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t* edata, void* userCtx);
     bool handleReceivedEdge(uint32_t nowTicks, int level);
     bool applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame, RxEvent& outEvent);
     static void noiseTimeoutCallback(void* arg);
@@ -172,6 +187,19 @@ private:
     // (the raw 32-bit register wraps at 2^32 ticks; a pre-divided value would wrap far earlier,
     // corrupting any duration whose two edges straddle that point).
     uint32_t rxCaptureTicksPerUs = 1;
+
+    // Ground-truth edge counter for DIO2, running in parallel with the MCPWM capture channel above:
+    // PCNT's counter register increments directly from GPIO transitions in hardware, with no per-edge
+    // CPU servicing required (only the rare, generously-spaced watch point in onPcntWatchPoint() needs
+    // one), so unlike the single-latch MCPWM capture channel it can't itself silently lose a count
+    // under interrupt-dispatch pressure. handleReceivedEdge() compares its own per-ISR-call tally
+    // (rxIsrEdgeCount) against this on every edge to detect when MCPWM capture coalesced >=2 real
+    // edges into one callback -- see configureEdgeCounter().
+    pcnt_unit_handle_t rxEdgeCountUnit = nullptr;
+    pcnt_channel_handle_t rxEdgeCountChannel = nullptr;
+    // Raw per-ISR-call edge count (glitches included, unlike rxState.bitCount). Only ever touched
+    // under rxStateMux, from handleReceivedEdge (ISR context) and onPcntWatchPoint (ISR context).
+    int32_t rxIsrEdgeCount = 0;
 
     portMUX_TYPE rxStateMux = portMUX_INITIALIZER_UNLOCKED;
 };
