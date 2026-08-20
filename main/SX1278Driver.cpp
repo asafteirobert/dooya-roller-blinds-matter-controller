@@ -303,6 +303,17 @@ void SX1278Driver::configureDioPins()
     // starts disabled, same as gpio_intr_disable() used to; enterReceiveMode() enables it.
 }
 
+void SX1278Driver::configureDebugPins()
+{
+    gpio_config_t debugConfig = {};
+    debugConfig.pin_bit_mask = (1ULL << SX1278_RX_DEBUG_EDGE_GPIO) | (1ULL << SX1278_RX_DEBUG_APPLY_GPIO);
+    debugConfig.mode = GPIO_MODE_OUTPUT;
+    debugConfig.pull_up_en = GPIO_PULLUP_DISABLE;
+    debugConfig.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    debugConfig.intr_type = GPIO_INTR_DISABLE;
+    gpio_config(&debugConfig);
+}
+
 void SX1278Driver::writeRegister(uint8_t address, uint8_t value)
 {
     uint8_t buffer[2] = { static_cast<uint8_t>(address | SPI_WRITE_BIT), value };
@@ -408,6 +419,7 @@ void SX1278Driver::init()
 {
     resetChip();
     configureDioPins();
+    configureDebugPins();
 
     spi_bus_config_t busConfig = {};
     busConfig.mosi_io_num = GPIO_NUM_23;
@@ -569,6 +581,8 @@ bool IRAM_ATTR SX1278Driver::onDio2Capture(mcpwm_cap_channel_handle_t /*capChann
 bool IRAM_ATTR SX1278Driver::applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame,
                                                RxEvent& outEvent)
 {
+    gpio_set_level(SX1278_RX_DEBUG_APPLY_GPIO, level);
+
     bool frameComplete = false;
     // Wraparound-safe: both operands are the same wrapping 32-bit raw tick counter, so plain
     // unsigned subtraction gives the correct elapsed ticks even across a wrap -- only convert to
@@ -714,6 +728,8 @@ void IRAM_ATTR SX1278Driver::logRxEvent(const RxEvent& event)
 // not (and no longer does) call it directly.
 bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
 {
+    gpio_set_level(SX1278_RX_DEBUG_EDGE_GPIO, level);
+
     bool frameComplete = false;
     std::array<uint8_t, 5> completedFrame{};
     RxEvent rxEvent{};

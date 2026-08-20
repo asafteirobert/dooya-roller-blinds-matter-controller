@@ -99,6 +99,7 @@ private:
 
     void resetChip();
     void configureDioPins();
+    void configureDebugPins();
     void configureRadio();
     void configureReceiver();
     void transmitWaveform(const std::vector<uint8_t>& waveform);
