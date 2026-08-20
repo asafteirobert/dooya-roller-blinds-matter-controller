@@ -10,6 +10,11 @@
 #include <freertos/queue.h>
 #include <freertos/task.h>
 
+// Lightweight types-only header (just the capture handle typedefs and mcpwm_capture_event_data_t)
+// -- unlike spi_device_t/esp_timer below, mcpwm_capture_event_data_t is an anonymous-struct
+// typedef with no tag name, so it can't be forward-declared and this can't be deferred to the .cpp.
+#include <driver/mcpwm_types.h>
+
 // Avoids pulling driver/spi_master.h (and its transitive ESP-IDF includes) into every file that
 // includes this header; spi_device_handle_t is just a pointer to this struct.
 struct spi_device_t;
@@ -29,9 +34,11 @@ struct esp_timer;
 //   submitted, so callers (Matter/timer callbacks) never block on the air time of a transmission.
 // - Whenever that task isn't actively transmitting, it leaves the radio in continuous OOK
 //   receive mode, listening for the physical remote. DIO2 mirrors the raw demodulated envelope
-//   in that mode; a GPIO interrupt timestamps every edge and decodes it in software (mirroring
-//   the encoding transmitWaveform() produces), handing off completed frames to a receiver task
-//   which invokes the callback registered via setReceiveCallback().
+//   in that mode; an MCPWM capture channel timestamps every edge in hardware (immune to the
+//   timing jitter a software GPIO-ISR timestamp would pick up from WiFi/BLE interrupt latency)
+//   and software decodes it (mirroring the encoding transmitWaveform() produces), handing off
+//   completed frames to a receiver task which invokes the callback registered via
+//   setReceiveCallback().
 class SX1278Driver
 {
     static constexpr char *TAG = "SX1278Driver";
@@ -104,9 +111,10 @@ private:
 
     static void senderTask(void* arg);
     static void receiverTask(void* arg);
-    static void dio2IsrHandler(void* arg);
-    void handleReceivedEdge(int64_t nowUs, int level);
-    bool applyEdgeToState(int64_t edgeUs, int level, std::array<uint8_t, 5>& outCompletedFrame, RxEvent& outEvent);
+    static bool onDio2Capture(mcpwm_cap_channel_handle_t capChannel, const mcpwm_capture_event_data_t* edata,
+                               void* userCtx);
+    bool handleReceivedEdge(uint32_t nowTicks, int level);
+    bool applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame, RxEvent& outEvent);
     static void noiseTimeoutCallback(void* arg);
     static void logRxEvent(const RxEvent& event);
 
@@ -134,7 +142,7 @@ private:
         Phase phase = Phase::Idle;
         uint8_t bitCount = 0;
         std::array<uint8_t, 5> frame{};
-        int64_t lastEdgeUs = 0;
+        uint32_t lastEdgeTicks = 0; // raw MCPWM capture-timer ticks -- see rxCaptureTicksPerUs
     } rxState;
 
     // An edge that's been seen but not yet believed: handleReceivedEdge() holds it here instead of
@@ -144,9 +152,25 @@ private:
     // either because the next edge is that far out, or because rxNoiseTimer's timeout fires first
     // (needed so the very last edge of a burst, with no further edge ever coming, still lands).
     bool rxPendingValid = false;
-    int64_t rxPendingEdgeUs = 0;
+    uint32_t rxPendingEdgeTicks = 0; // raw MCPWM capture-timer ticks -- see rxCaptureTicksPerUs
     int rxPendingLevel = 0;
     struct esp_timer* rxNoiseTimer = nullptr;
+
+    // Hardware edge timing for DIO2: the MCPWM capture channel latches (tick count, edge polarity)
+    // atomically at the instant of the electrical edge, so onDio2Capture()'s timestamp can't be
+    // corrupted by ISR scheduling delay the way a software esp_timer_get_time() read could be --
+    // see configureDioPins() for why that matters on this board.
+    mcpwm_cap_timer_handle_t rxCaptureTimer = nullptr;
+    mcpwm_cap_channel_handle_t rxCaptureChannel = nullptr;
+    // ESP32's capture timer clock is hardwired to the APB clock (80MHz) -- the resolution_hz
+    // requested in configureDioPins() is only a hint the driver is free to ignore on this target,
+    // and does here, so cap_value arrives in raw ~12.5ns ticks, not microseconds. This is the
+    // actual resolution read back after creating the timer, divided into every duration *after* a
+    // wraparound-safe raw-tick subtraction (see applyEdgeToState/handleReceivedEdge) -- converting
+    // each absolute cap_value to microseconds before subtracting would wrap at the wrong modulus
+    // (the raw 32-bit register wraps at 2^32 ticks; a pre-divided value would wrap far earlier,
+    // corrupting any duration whose two edges straddle that point).
+    uint32_t rxCaptureTicksPerUs = 1;
 
     portMUX_TYPE rxStateMux = portMUX_INITIALIZER_UNLOCKED;
 };

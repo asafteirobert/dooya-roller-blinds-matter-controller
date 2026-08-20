@@ -37,10 +37,17 @@ CONFIG_SPI_MASTER_ISR_IN_IRAM=n
 
 # ButtonDriver's iot_button component installs the shared GPIO ISR service with
 # ESP_INTR_FLAG_IRAM, which makes it (and therefore every gpio_isr_handler_add'ed handler on any
-# pin, including SX1278Driver's DIO2 receive decoder) IRAM-resident and liable to run while flash
-# cache is disabled (e.g. during an NVS write). gpio_get_level/gpio_intr_disable must therefore
-# also be IRAM-resident, or calling them from that handler risks a crash during such a window.
+# pin) IRAM-resident and liable to run while flash cache is disabled (e.g. during an NVS write).
+# gpio_get_level/gpio_intr_disable must therefore also be IRAM-resident, or calling them from that
+# handler risks a crash during such a window.
 CONFIG_GPIO_CTRL_FUNC_IN_IRAM=y
+
+# SX1278Driver's DIO2 receive decoder runs off the MCPWM capture peripheral (not the shared GPIO
+# ISR service above), for the same cache-disabled-during-an-NVS-write reason: its callback is
+# marked IRAM_ATTR, and this makes mcpwm_capture_channel_register_event_callbacks() verify at
+# startup that the callback and its user-data pointer are actually IRAM/DRAM-safe, turning a
+# possible latent crash into an immediate, loud failure instead.
+CONFIG_MCPWM_ISR_CACHE_SAFE=y
 
 # disable softap by default
 CONFIG_ESP_WIFI_SOFTAP_SUPPORT=n
