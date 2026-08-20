@@ -15,6 +15,13 @@
 
 namespace
 {
+// logRxEvent() runs from ISR context and may run with the flash cache disabled (e.g. mid-NVS-read,
+// see the crash this fixed: "Cache disabled but cached memory region accessed" from ets_printf
+// dereferencing SX1278Driver::TAG). ESP_DRAM_LOG* only keeps its *format* string out of flash --
+// the tag argument is printed as-is, so it also needs to live in real DRAM rather than the normal
+// flash-mapped rodata a plain string literal/constexpr char* would land in.
+static const DRAM_ATTR char ISR_LOG_TAG[] = "SX1278Driver";
+
 // --- OOK/PWM timing
 constexpr uint32_t SYNC_US = 4600;
 constexpr uint32_t SHORT_US = 350; // logical bit 0
@@ -80,6 +87,13 @@ constexpr int64_t RX_LONG_MAX_US = 1000; // LONG_US(700) + ~43%, comfortably bel
 constexpr int64_t RX_SYNC_MIN_US = 2800; // SYNC_US(4600) - ~39%, comfortably above RX_LONG_MAX_US
 constexpr int64_t RX_SYNC_MAX_US = 6200; // SYNC_US(4600) + ~35%
 constexpr uint8_t RX_FRAME_BITS = 40;
+
+// Below RX_SHORT_MIN_US by a wide margin, so a run this brief can never be a real mark or space --
+// it's an RF/electrical glitch on DIO2. An edge is only applied to rxState once it has survived
+// this long without a second edge closing it (see handleReceivedEdge()/rxPendingValid), so a spike
+// that dips high->low->high or low->high->low within this window never reaches the state machine
+// on either edge; the run it interrupted is read as one continuous run instead of two.
+constexpr int64_t RX_NOISE_MAX_US = 50;
 
 // The sync mark is always followed by a fixed 2*LONG_US (1400us) low gap before the first bit's
 // mark starts (see buildWaveform()). Requiring that gap to also match before committing to
@@ -396,6 +410,15 @@ void SX1278Driver::init()
                 RECEIVER_TASK_PRIORITY, &this->receiverTaskHandle);
     xTaskCreate(&SX1278Driver::senderTask, "sx1278_sender", SENDER_TASK_STACK_WORDS, this, SENDER_TASK_PRIORITY,
                 &this->senderTaskHandle);
+
+    // Flushes a still-pending RX edge once it's survived RX_NOISE_MAX_US without a glitch-close --
+    // see the rxPendingValid comment in the header. Needed so the last edge of a burst (no further
+    // edge ever arrives to confirm it directly) still gets applied.
+    esp_timer_create_args_t noiseTimerArgs = {};
+    noiseTimerArgs.callback = &SX1278Driver::noiseTimeoutCallback;
+    noiseTimerArgs.arg = this;
+    noiseTimerArgs.name = "sx1278_rx_noise";
+    esp_timer_create(&noiseTimerArgs, &this->rxNoiseTimer);
 }
 
 // Switches the radio into continuous OOK receive mode and (re-)arms the DIO2 interrupt, ready to
@@ -406,8 +429,11 @@ void SX1278Driver::enterReceiveMode()
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);
     writeRegister(REG_OP_MODE, OPMODE_RX_CONTINUOUS);
 
+    esp_timer_stop(this->rxNoiseTimer); // no-op (ignored error) if nothing was pending
+
     portENTER_CRITICAL(&this->rxStateMux);
     this->rxState = RxState{};
+    this->rxPendingValid = false;
     portEXIT_CRITICAL(&this->rxStateMux);
 
     gpio_intr_enable(SX1278_DIO2_GPIO);
@@ -474,30 +500,43 @@ void IRAM_ATTR SX1278Driver::dio2IsrHandler(void* arg)
     self->handleReceivedEdge(now, level);
 }
 
-// Runs in ISR context on every DIO2 edge while the radio is idling in receive mode (disabled
-// during transmission, see transmitWaveform()). Reconstructs the same 40-bit Dooya frame
-// buildWaveform() encodes: a HIGH ("mark") run in the SYNC_US range moves to AwaitingSyncGap, the
-// LOW ("space") run that follows it is checked against RX_POST_SYNC_GAP_*_US before frame
-// collection actually starts (this second, independent coincidence is what tells a real sync
-// pulse apart from a noise glitch that happens to land in the SYNC_US window), and every mark
-// after that decodes one payload bit by its duration alone (see the RX_*_US tolerance comment
-// above). Anything that doesn't fit an expected width abandons the in-progress frame and waits
-// for the next sync pulse, so a corrupted/partial reception self-heals on the next button-press
-// repeat instead of needing an explicit timeout.
-void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
+// Applies one confirmed (not a noise glitch) edge to rxState and returns true, with
+// outCompletedFrame filled in, if it completes a 40-bit frame; outEvent describes anything
+// diagnostically interesting that happened (sync seen, frame dropped and where) for the caller to
+// log once it's released rxStateMux -- see the RxEvent comment in the header for why this doesn't
+// just log directly. Caller must hold rxStateMux; runs both from ISR context (handleReceivedEdge)
+// and task context (noiseTimeoutCallback), so it touches nothing but its arguments and rxState.
+//
+// Reconstructs the same 40-bit Dooya frame buildWaveform() encodes: a HIGH ("mark") run in the
+// SYNC_US range moves to AwaitingSyncGap, the LOW ("space") run that follows it is checked against
+// RX_POST_SYNC_GAP_*_US before frame collection actually starts (this second, independent
+// coincidence is what tells a real sync pulse apart from a noise glitch that happens to land in
+// the SYNC_US window), and every mark after that decodes one payload bit by its duration alone
+// (see the RX_*_US tolerance comment above). Anything that doesn't fit an expected width abandons
+// the in-progress frame and waits for the next sync pulse, so a corrupted/partial reception
+// self-heals on the next button-press repeat instead of needing an explicit timeout.
+bool IRAM_ATTR SX1278Driver::applyEdgeToState(int64_t edgeUs, int level, std::array<uint8_t, 5>& outCompletedFrame,
+                                               RxEvent& outEvent)
 {
     bool frameComplete = false;
-    std::array<uint8_t, 5> completedFrame{};
-
-    portENTER_CRITICAL_ISR(&this->rxStateMux);
-
-    int64_t durationUs = nowUs - this->rxState.lastEdgeUs;
-    this->rxState.lastEdgeUs = nowUs;
+    int64_t durationUs = edgeUs - this->rxState.lastEdgeUs;
+    this->rxState.lastEdgeUs = edgeUs;
+    outEvent = RxEvent{};
 
     if (level == 0) // falling edge: the HIGH ("mark") run that just ended was durationUs long
     {
         if (durationUs >= RX_SYNC_MIN_US && durationUs <= RX_SYNC_MAX_US)
         {
+            if (this->rxState.phase == RxState::Phase::InFrame)
+            {
+                // A sync-length mark showed up mid-frame instead of a payload bit -- whatever was
+                // collected so far is abandoned in favour of chasing this new sync.
+                outEvent = { RxEvent::Kind::SyncAbortedFrame, durationUs, this->rxState.bitCount };
+            }
+            else
+            {
+                outEvent = { RxEvent::Kind::SyncDetected, durationUs, 0 };
+            }
             this->rxState.phase = RxState::Phase::AwaitingSyncGap;
         }
         else if (this->rxState.phase == RxState::Phase::InFrame)
@@ -518,6 +557,7 @@ void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
                 // abandon this frame rather than risk committing a wrong bit. Self-heals on the
                 // next sync pulse -- either a repeat of the same button press or the next one.
                 haveBit = false;
+                outEvent = { RxEvent::Kind::BitInvalid, durationUs, this->rxState.bitCount };
                 this->rxState.phase = RxState::Phase::Idle;
             }
 
@@ -535,7 +575,7 @@ void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
                 {
                     this->rxState.phase = RxState::Phase::Idle;
                     frameComplete = true;
-                    completedFrame = this->rxState.frame;
+                    outCompletedFrame = this->rxState.frame;
                 }
             }
         }
@@ -556,11 +596,106 @@ void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
         }
         else
         {
+            outEvent = { RxEvent::Kind::GapInvalid, durationUs, 0 };
             this->rxState.phase = RxState::Phase::Idle;
         }
     }
 
+    return frameComplete;
+}
+
+// Logs an RxEvent produced by applyEdgeToState(). Must only be called *outside* rxStateMux (see
+// the RxEvent comment in the header). Safe to call from ISR context with the flash cache disabled:
+// ESP_DRAM_LOG* keeps its format string out of flash and (with CONFIG_LOG_IN_IRAM, set for this
+// project) resolves to a direct esp_rom_printf call with no heap, no vfs, and no lock -- the same
+// pattern ESP-IDF's own low-level drivers (e.g. esp_driver_rmt) use for ISR-adjacent logging. The
+// tag passed in must be ISR_LOG_TAG, not the class's TAG -- see its comment.
+void IRAM_ATTR SX1278Driver::logRxEvent(const RxEvent& event)
+{
+    switch (event.kind)
+    {
+    case RxEvent::Kind::SyncDetected:
+        ESP_DRAM_LOGI(ISR_LOG_TAG, "RX: sync pulse detected (%lld us)", static_cast<long long>(event.durationUs));
+        break;
+    case RxEvent::Kind::SyncAbortedFrame:
+        ESP_DRAM_LOGW(ISR_LOG_TAG, "RX: sync pulse seen mid-frame, dropped frame at bit %u (re-sync mark %lld us)",
+                      static_cast<unsigned>(event.bitCount), static_cast<long long>(event.durationUs));
+        break;
+    case RxEvent::Kind::GapInvalid:
+        ESP_DRAM_LOGW(ISR_LOG_TAG, "RX: dropped frame before bit 0, post-sync gap %lld us out of range [%lld, %lld]",
+                      static_cast<long long>(event.durationUs), static_cast<long long>(RX_POST_SYNC_GAP_MIN_US),
+                      static_cast<long long>(RX_POST_SYNC_GAP_MAX_US));
+        break;
+    case RxEvent::Kind::BitInvalid:
+        ESP_DRAM_LOGW(ISR_LOG_TAG, "RX: dropped frame at bit %u, mark duration %lld us out of range",
+                      static_cast<unsigned>(event.bitCount), static_cast<long long>(event.durationUs));
+        break;
+    case RxEvent::Kind::GlitchDropped:
+        ESP_DRAM_LOGW(ISR_LOG_TAG, "RX: discarded noise glitch mid-frame at bit %u, edges %lld us apart (< %lld us threshold)",
+                      static_cast<unsigned>(event.bitCount), static_cast<long long>(event.durationUs),
+                      static_cast<long long>(RX_NOISE_MAX_US));
+        break;
+    case RxEvent::Kind::None:
+        break;
+    }
+}
+
+// Runs in ISR context on every DIO2 edge while the radio is idling in receive mode (disabled
+// during transmission, see transmitWaveform()). Never applies an edge to rxState directly --
+// a noise glitch looks identical to a real edge until the *next* edge shows how long the run it
+// opened actually lasted, so this only ever buffers the latest edge in rxPendingValid/
+// rxPendingEdgeUs/rxPendingLevel and lets applyEdgeToState() see it once it's confirmed real:
+//   - if the next edge arrives under RX_NOISE_MAX_US later, the buffered edge and this new one are
+//     both noise -- neither is ever applied, and the buffer is simply cleared;
+//   - if the next edge arrives RX_NOISE_MAX_US or later, the buffered edge survived long enough to
+//     be real -- it's applied now, and this new edge takes its place in the buffer;
+//   - if no next edge arrives at all (the last edge of a burst), rxNoiseTimer's timeout applies it
+//     from noiseTimeoutCallback instead, once RX_NOISE_MAX_US has passed with nothing to glitch it.
+void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
+{
+    bool frameComplete = false;
+    std::array<uint8_t, 5> completedFrame{};
+    RxEvent rxEvent{};
+
+    portENTER_CRITICAL_ISR(&this->rxStateMux);
+
+    if (this->rxPendingValid && (nowUs - this->rxPendingEdgeUs) < RX_NOISE_MAX_US)
+    {
+        // Glitch: the buffered edge and this one are both noise. esp_timer_stop() here races the
+        // (vanishingly unlikely) case where rxNoiseTimer's timeout is already firing for the
+        // buffered edge; if it wins that race regardless, the worst case is one stray bit fed into
+        // rxState, which self-heals like any other corrupted frame (see applyEdgeToState).
+        esp_timer_stop(this->rxNoiseTimer);
+        this->rxPendingValid = false;
+        // Only worth logging while a frame is actually being collected -- ambient RF noise glitches
+        // constantly while idling between transmissions, and logging every one of those floods the
+        // log without telling us anything about dropped packets.
+        if (this->rxState.phase == RxState::Phase::InFrame)
+        {
+            rxEvent = { RxEvent::Kind::GlitchDropped, nowUs - this->rxPendingEdgeUs, this->rxState.bitCount };
+        }
+    }
+    else
+    {
+        if (this->rxPendingValid)
+        {
+            esp_timer_stop(this->rxNoiseTimer);
+            frameComplete = this->applyEdgeToState(this->rxPendingEdgeUs, this->rxPendingLevel, completedFrame, rxEvent);
+        }
+
+        this->rxPendingValid = true;
+        this->rxPendingEdgeUs = nowUs;
+        this->rxPendingLevel = level;
+        esp_timer_start_once(this->rxNoiseTimer, RX_NOISE_MAX_US);
+    }
+
     portEXIT_CRITICAL_ISR(&this->rxStateMux);
+
+    // Logged only after releasing rxStateMux -- see the RxEvent comment in the header.
+    if (rxEvent.kind != RxEvent::Kind::None)
+    {
+        logRxEvent(rxEvent);
+    }
 
     if (frameComplete)
     {
@@ -570,6 +705,38 @@ void IRAM_ATTR SX1278Driver::handleReceivedEdge(int64_t nowUs, int level)
         {
             portYIELD_FROM_ISR();
         }
+    }
+}
+
+// Runs on the esp_timer task, RX_NOISE_MAX_US after the last edge handleReceivedEdge() buffered,
+// unless a closer or a later edge got there first and already cleared rxPendingValid (see there).
+// Applies that edge the same way a confirming next edge would have -- this is what lets the very
+// last edge of a burst (no further DIO2 activity to confirm it) still make it into rxState instead
+// of being silently lost while waiting for an edge that's never coming.
+void SX1278Driver::noiseTimeoutCallback(void* arg)
+{
+    auto* self = static_cast<SX1278Driver*>(arg);
+    bool frameComplete = false;
+    std::array<uint8_t, 5> completedFrame{};
+    RxEvent rxEvent{};
+
+    portENTER_CRITICAL(&self->rxStateMux);
+    if (self->rxPendingValid)
+    {
+        frameComplete = self->applyEdgeToState(self->rxPendingEdgeUs, self->rxPendingLevel, completedFrame, rxEvent);
+        self->rxPendingValid = false;
+    }
+    portEXIT_CRITICAL(&self->rxStateMux);
+
+    // Logged only after releasing rxStateMux -- see the RxEvent comment in the header.
+    if (rxEvent.kind != RxEvent::Kind::None)
+    {
+        logRxEvent(rxEvent);
+    }
+
+    if (frameComplete)
+    {
+        xQueueSend(self->rxFrameQueue, &completedFrame, 0);
     }
 }
 
@@ -597,8 +764,15 @@ void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
 {
     // Stop reacting to DIO2 edges and drop out of continuous Rx mode (the sender task may be
     // calling this while the radio is still listening) before touching any packet-framing
-    // registers below.
+    // registers below. Also cancel any RX edge still waiting out RX_NOISE_MAX_US -- left alone, its
+    // timeout would otherwise fire mid-transmission and feed a stale, never-really-received edge
+    // into rxState (see rxNoiseTimer).
     gpio_intr_disable(SX1278_DIO2_GPIO);
+    esp_timer_stop(this->rxNoiseTimer);
+    portENTER_CRITICAL(&this->rxStateMux);
+    this->rxPendingValid = false;
+    portEXIT_CRITICAL(&this->rxStateMux);
+
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);
 
     size_t total = waveform.size();

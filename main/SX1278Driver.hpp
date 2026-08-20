@@ -13,6 +13,8 @@
 // Avoids pulling driver/spi_master.h (and its transitive ESP-IDF includes) into every file that
 // includes this header; spi_device_handle_t is just a pointer to this struct.
 struct spi_device_t;
+// Same trick for esp_timer.h; esp_timer_handle_t is just a pointer to this struct.
+struct esp_timer;
 
 // Drives an SX1278 module over VSPI to replay Dooya remote control commands, and to decode the
 // same commands when the physical remote transmits them directly to the blind.
@@ -64,6 +66,30 @@ private:
         uint8_t repeats;
     };
 
+    // Diagnostic-only description of one RX edge-processing outcome -- either what
+    // applyEdgeToState() did with a confirmed edge, or a glitch handleReceivedEdge() discarded
+    // before the edge ever reached applyEdgeToState(). It's an out-parameter rather than logged
+    // directly at the point of detection because every caller runs under rxStateMux (ISR-disabled
+    // critical section from handleReceivedEdge, interrupts-disabled critical section from
+    // noiseTimeoutCallback) -- logging while holding that lock would stall the other core for
+    // however long the print takes. Callers log it via logRxEvent() only after releasing the lock.
+    struct RxEvent
+    {
+        enum class Kind : uint8_t
+        {
+            None,
+            GlitchDropped,    // two edges arrived within RX_NOISE_MAX_US of each other while InFrame; both
+                              // discarded as noise (only reported mid-frame -- see handleReceivedEdge)
+            SyncDetected,     // a mark in the sync-length range was seen
+            SyncAbortedFrame, // ...and it interrupted an already in-progress frame, dropping it
+            GapInvalid,       // the post-sync low gap didn't match, dropped before any bits
+            BitInvalid,       // a mark matched neither the short nor long band, dropped mid-frame
+        };
+        Kind kind = Kind::None;
+        int64_t durationUs = 0;
+        uint8_t bitCount = 0; // bits collected so far, for GlitchDropped/AbortedFrame/BitInvalid
+    };
+
     void resetChip();
     void configureDioPins();
     void configureRadio();
@@ -80,6 +106,9 @@ private:
     static void receiverTask(void* arg);
     static void dio2IsrHandler(void* arg);
     void handleReceivedEdge(int64_t nowUs, int level);
+    bool applyEdgeToState(int64_t edgeUs, int level, std::array<uint8_t, 5>& outCompletedFrame, RxEvent& outEvent);
+    static void noiseTimeoutCallback(void* arg);
+    static void logRxEvent(const RxEvent& event);
 
     spi_device_t* spiDevice = nullptr;
     QueueHandle_t commandQueue = nullptr;
@@ -89,9 +118,11 @@ private:
     QueueHandle_t rxFrameQueue = nullptr;
     TaskHandle_t receiverTaskHandle = nullptr;
 
-    // In-progress RX decode. Touched only from handleReceivedEdge (ISR context, DIO2 interrupt
-    // disabled while transmitting) and reset from enterReceiveMode() (task context, only while
-    // that interrupt is disabled); rxStateMux makes that handover safe across cores.
+    // In-progress RX decode. Only ever mutated by applyEdgeToState() -- called either from
+    // handleReceivedEdge (ISR context, DIO2 interrupt disabled while transmitting) once an edge is
+    // confirmed real, or from noiseTimeoutCallback (esp_timer task context) -- and reset from
+    // enterReceiveMode()/transmitWaveform() (task context, only while that interrupt is disabled);
+    // rxStateMux makes that handover safe across cores.
     struct RxState
     {
         enum class Phase : uint8_t
@@ -105,5 +136,17 @@ private:
         std::array<uint8_t, 5> frame{};
         int64_t lastEdgeUs = 0;
     } rxState;
+
+    // An edge that's been seen but not yet believed: handleReceivedEdge() holds it here instead of
+    // applying it to rxState immediately, because a genuine noise glitch looks identical to a real
+    // edge until the *next* edge shows how long the run it opened actually lasted. It's applied to
+    // rxState -- becoming "real" -- once RX_NOISE_MAX_US passes without a glitch-close arriving,
+    // either because the next edge is that far out, or because rxNoiseTimer's timeout fires first
+    // (needed so the very last edge of a burst, with no further edge ever coming, still lands).
+    bool rxPendingValid = false;
+    int64_t rxPendingEdgeUs = 0;
+    int rxPendingLevel = 0;
+    struct esp_timer* rxNoiseTimer = nullptr;
+
     portMUX_TYPE rxStateMux = portMUX_INITIALIZER_UNLOCKED;
 };
