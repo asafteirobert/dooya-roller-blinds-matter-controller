@@ -7,6 +7,7 @@
 
 #include <driver/gpio.h>
 #include <driver/mcpwm_cap.h>
+#include <driver/pulse_cnt.h>
 #include <driver/spi_master.h>
 #include <esp_attr.h>
 #include <esp_log.h>
@@ -88,12 +89,11 @@ struct Dio2SetupContext
 // ESP32's PCNT counter register is a signed 16-bit field.
 constexpr int PCNT_LOW_LIMIT = -32768;
 constexpr int PCNT_HIGH_LIMIT = 32767;
-// One decoded frame is ~82 edges (sync + post-sync gap + 40 bits x mark/space, see buildWaveform()).
-// 20000 leaves >12000 edges of headroom below the hardware ceiling -- at the worst-case edge rate the
-// noise filter allows (RX_NOISE_MAX_US=50us minimum spacing => <=20000 edges/sec), that's >0.6s for
-// onPcntWatchPoint() -- which has the same single-pending-bit ISR limitation as MCPWM capture -- to
-// actually get serviced before the hardware register itself could wrap.
-constexpr int PCNT_WATCH_POINT = 20000;
+// handleReceivedEdge() resets rxIsrEdgeCount (and the PCNT hardware counter alongside it) back to 0
+// once it reaches this, well before either could approach the hardware ceiling above -- see there.
+// Plain threshold, not a hardware watch point, so there's no exact-value-match concern; any value
+// comfortably below PCNT_HIGH_LIMIT is safe.
+constexpr int PCNT_RESET_THRESHOLD = 20000;
 
 // --- OOK/PWM RX decode tolerances, mirroring buildWaveform()'s encoding in reverse. Only the
 // duration of each HIGH ("mark") run is used to decode a bit -- LONG_US means 1, SHORT_US means
@@ -256,7 +256,8 @@ void SX1278Driver::configureEdgeCounter()
     pcnt_unit_config_t unitConfig = {};
     unitConfig.low_limit = PCNT_LOW_LIMIT;
     unitConfig.high_limit = PCNT_HIGH_LIMIT;
-    unitConfig.intr_priority = 3; // same reasoning as capChanConfig.intr_priority below
+    // No intr_priority to set: this unit registers no watch point/event callback below, so it never
+    // allocates an interrupt at all -- handleReceivedEdge() only ever polls its count directly.
     esp_err_t err = pcnt_new_unit(&unitConfig, &this->rxEdgeCountUnit);
     if (err != ESP_OK)
     {
@@ -281,21 +282,6 @@ void SX1278Driver::configureEdgeCounter()
                                   PCNT_CHANNEL_EDGE_ACTION_INCREASE);
     pcnt_channel_set_level_action(this->rxEdgeCountChannel, PCNT_CHANNEL_LEVEL_ACTION_KEEP,
                                    PCNT_CHANNEL_LEVEL_ACTION_KEEP);
-
-    err = pcnt_unit_add_watch_point(this->rxEdgeCountUnit, PCNT_WATCH_POINT);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to add DIO2 edge-count watch point: %d", err);
-        return;
-    }
-
-    pcnt_event_callbacks_t pcntCallbacks = { .on_reach = &SX1278Driver::onPcntWatchPoint };
-    err = pcnt_unit_register_event_callbacks(this->rxEdgeCountUnit, &pcntCallbacks, this);
-    if (err != ESP_OK)
-    {
-        ESP_LOGE(TAG, "Failed to register DIO2 edge-count watch point callback: %d", err);
-        return;
-    }
 
     err = pcnt_unit_enable(this->rxEdgeCountUnit);
     if (err != ESP_OK)
@@ -718,6 +704,7 @@ bool IRAM_ATTR SX1278Driver::applyEdgeToState(uint32_t edgeTicks, int level, std
     // value first would wrap at the wrong modulus (see the header comment on rxCaptureTicksPerUs).
     uint32_t deltaTicks = static_cast<uint32_t>(edgeTicks - this->rxState.lastEdgeTicks);
     this->rxState.lastEdgeTicks = edgeTicks;
+    this->rxState.lastEdgeLevel = level;
     int64_t durationUs = deltaTicks / this->rxCaptureTicksPerUs;
     outEvent = RxEvent{};
 
@@ -838,6 +825,10 @@ void IRAM_ATTR SX1278Driver::logRxEvent(const RxEvent& event)
                       "RX: MCPWM capture missed %lld DIO2 edge(s) at bit %u, dropped frame and resynced to PCNT",
                       static_cast<long long>(event.durationUs), static_cast<unsigned>(event.bitCount));
         break;
+    case RxEvent::Kind::HardwareEdgeRecovered:
+        ESP_DRAM_LOGI(ISR_LOG_TAG, "RX: recovered a single dropped DIO2 edge at bit %u (glitch pair, no frame lost)",
+                      static_cast<unsigned>(event.bitCount));
+        break;
     case RxEvent::Kind::None:
         break;
     }
@@ -870,69 +861,115 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
     portENTER_CRITICAL_ISR(&this->rxStateMux);
 
     ++this->rxIsrEdgeCount;
+    // Set when the PCNT reconciliation below fully accounts for this edge itself (see the
+    // HardwareEdgeRecovered case) -- the normal glitch/apply logic further down must not also run
+    // for it, since there's nothing left to buffer or apply: the recovery already decided this
+    // edge's fate.
+    bool edgeRecoveredByPcnt = false;
     if (this->rxEdgeCountUnit != nullptr)
     {
         int pcntCount = 0;
         pcnt_unit_get_count(this->rxEdgeCountUnit, &pcntCount);
         if (pcntCount != this->rxIsrEdgeCount)
         {
-            // MCPWM capture never fired for at least one real DIO2 edge (see configureEdgeCounter()).
-            // Whatever is buffered in rxPendingValid straddles the gap -- its duration was measured
-            // against a stale reference point, so discard it and abandon any in-progress frame instead
-            // of letting a corrupted duration reach applyEdgeToState(); decoding resyncs cleanly on
-            // the next sync pulse, same as the BitInvalid/GapInvalid paths there.
-            rxEvent = { RxEvent::Kind::HardwareEdgeDropped, pcntCount - this->rxIsrEdgeCount, this->rxState.bitCount };
-            this->rxState.phase = RxState::Phase::Idle;
-            this->rxPendingValid = false;
-            esp_timer_stop(this->rxNoiseTimer);
+            // The edge to compare this one's level against: the still-unconfirmed pending edge if
+            // there is one, otherwise the last edge applyEdgeToState() actually confirmed -- covers
+            // both a glitch racing MCPWM's latch shortly after a real edge (rxPendingValid still
+            // true) *and* one arriving after that pending edge already got applied by rxNoiseTimer,
+            // or cancelled outright as its own glitch (rxPendingValid false either way, but
+            // rxState.lastEdgeLevel still holds the DIO2 line's actual last known-good level). No
+            // reference exists yet only right after enterReceiveMode()/transmitWaveform() resets
+            // rxState, when lastEdgeLevel's sentinel -1 can't match either real level.
+            bool haveReferenceLevel = this->rxPendingValid || this->rxState.lastEdgeLevel != -1;
+            int referenceLevel = this->rxPendingValid ? this->rxPendingLevel : this->rxState.lastEdgeLevel;
+            if (pcntCount == this->rxIsrEdgeCount + 1 && haveReferenceLevel && referenceLevel == level)
+            {
+                // The common case: a very short glitch shortly after a real edge raced the MCPWM
+                // capture channel's single latch and overwrote it before the ISR serviced it (see
+                // configureEdgeCounter()) -- exactly one edge is missing. Because DIO2 can only ever
+                // alternate level, and this edge's level matches the reference edge above, the
+                // missing edge must have had the opposite level: together they're a glitch pair that
+                // returns to the reference level, exactly the shape RX_NOISE_MAX_US already discards
+                // below. Recover by treating this edge as that glitch pair's second half -- leave
+                // rxState/the pending buffer exactly as they are (as if neither the missing edge nor
+                // this one ever happened) instead of aborting the whole in-progress frame.
+                //rxEvent = { RxEvent::Kind::HardwareEdgeRecovered, 1, this->rxState.bitCount };
+                edgeRecoveredByPcnt = true;
+            }
+            else
+            {
+                // MCPWM capture never fired for at least one real DIO2 edge. Whatever is buffered in
+                // rxPendingValid straddles the gap -- its duration was measured against a stale
+                // reference point, so discard it and abandon any in-progress frame instead of letting
+                // a corrupted duration reach applyEdgeToState(); decoding resyncs cleanly on the next
+                // sync pulse, same as the BitInvalid/GapInvalid paths there.
+                rxEvent = { RxEvent::Kind::HardwareEdgeDropped, pcntCount - this->rxIsrEdgeCount, this->rxState.bitCount };
+                this->rxState.phase = RxState::Phase::Idle;
+                this->rxPendingValid = false;
+                esp_timer_stop(this->rxNoiseTimer);
+            }
             this->rxIsrEdgeCount = pcntCount; // re-baseline to hardware ground truth
         }
-    }
 
-    // Wraparound-safe unsigned subtraction on raw ticks, converted to microseconds only after
-    // subtracting -- see the comment on rxCaptureTicksPerUs in the header and in applyEdgeToState().
-    uint32_t glitchDeltaUs = static_cast<uint32_t>(nowTicks - this->rxPendingEdgeTicks) / this->rxCaptureTicksPerUs;
-    if (this->rxPendingValid && glitchDeltaUs < RX_NOISE_MAX_US)
-    {
-        // Glitch: the buffered edge and this one are both noise.
-        esp_timer_stop(this->rxNoiseTimer);
-        this->rxPendingValid = false;
-        // Only worth logging while a frame is actually being collected -- ambient RF noise glitches
-        // constantly while idling between transmissions, and logging every one of those floods the
-        // log without telling us anything about dropped packets.
-        //if (this->rxState.phase == RxState::Phase::InFrame)
-        //{
-        //    rxEvent = { RxEvent::Kind::GlitchDropped, glitchDeltaUs, this->rxState.bitCount };
-        //}
-    }
-    else
-    {
-        if (this->rxPendingValid)
+        // rxIsrEdgeCount is now guaranteed equal to the live PCNT count read above (either they
+        // already matched, or the re-baseline just above made them match) -- periodically reset both
+        // back to 0 together, right here in the same edge that's already touching both, well before
+        // either could approach PCNT_HIGH_LIMIT. No separate watch point/interrupt needed for this:
+        // every edge already polls the live count, so a plain threshold check on it is sufficient.
+        if (this->rxIsrEdgeCount >= PCNT_RESET_THRESHOLD)
         {
-            frameComplete =
-                this->applyEdgeToState(this->rxPendingEdgeTicks, this->rxPendingLevel, completedFrame, rxEvent);
+            pcnt_unit_clear_count(this->rxEdgeCountUnit);
+            this->rxIsrEdgeCount = 0;
         }
+    }
 
-        // Stopped unconditionally, not just when rxPendingValid was set: noiseTimeoutCallback's
-        // timer removes itself from esp_timer's internal alarm list (making it look "unarmed") and
-        // drops esp_timer's own lock *before* it ever touches rxStateMux -- see esp_timer.c's
-        // timer_process_alarm(). So a stale callback can still be in flight, about to apply/clear
-        // whatever is *currently* pending, even after we've moved on to a newer edge here. If that
-        // happens, the fresh timer we armed for this newer edge gets orphaned: still ticking, but
-        // for an edge the stale callback already consumed. Skipping this stop() whenever our own
-        // rxPendingValid happened to read false left esp_timer_start_once() below silently fail
-        // (ESP_ERR_INVALID_STATE, unchecked) on that orphaned timer, so the edge being buffered here
-        // got no flush timer at all -- harmless for most edges (the next edge's arrival still
-        // applies it via the branch above), but fatal for the last mark of a frame, which has no
-        // next edge to rescue it before the next sync pulse's edge shows up and gets misread against
-        // a stale reference point. Calling stop() here regardless -- a no-op if nothing was armed --
-        // guarantees the start_once() below is never rejected as "already armed".
-        esp_timer_stop(this->rxNoiseTimer);
+    if (!edgeRecoveredByPcnt)
+    {
+        // Wraparound-safe unsigned subtraction on raw ticks, converted to microseconds only after
+        // subtracting -- see the comment on rxCaptureTicksPerUs in the header and in applyEdgeToState().
+        uint32_t glitchDeltaUs = static_cast<uint32_t>(nowTicks - this->rxPendingEdgeTicks) / this->rxCaptureTicksPerUs;
+        if (this->rxPendingValid && glitchDeltaUs < RX_NOISE_MAX_US)
+        {
+            // Glitch: the buffered edge and this one are both noise.
+            esp_timer_stop(this->rxNoiseTimer);
+            this->rxPendingValid = false;
+            // Only worth logging while a frame is actually being collected -- ambient RF noise glitches
+            // constantly while idling between transmissions, and logging every one of those floods the
+            // log without telling us anything about dropped packets.
+            //if (this->rxState.phase == RxState::Phase::InFrame)
+            //{
+            //    rxEvent = { RxEvent::Kind::GlitchDropped, glitchDeltaUs, this->rxState.bitCount };
+            //}
+        }
+        else
+        {
+            if (this->rxPendingValid)
+            {
+                frameComplete =
+                    this->applyEdgeToState(this->rxPendingEdgeTicks, this->rxPendingLevel, completedFrame, rxEvent);
+            }
 
-        this->rxPendingValid = true;
-        this->rxPendingEdgeTicks = nowTicks;
-        this->rxPendingLevel = level;
-        esp_timer_start_once(this->rxNoiseTimer, RX_NOISE_MAX_US);
+            // Stopped unconditionally, not just when rxPendingValid was set: noiseTimeoutCallback's
+            // timer removes itself from esp_timer's internal alarm list (making it look "unarmed") and
+            // drops esp_timer's own lock *before* it ever touches rxStateMux -- see esp_timer.c's
+            // timer_process_alarm(). So a stale callback can still be in flight, about to apply/clear
+            // whatever is *currently* pending, even after we've moved on to a newer edge here. If that
+            // happens, the fresh timer we armed for this newer edge gets orphaned: still ticking, but
+            // for an edge the stale callback already consumed. Skipping this stop() whenever our own
+            // rxPendingValid happened to read false left esp_timer_start_once() below silently fail
+            // (ESP_ERR_INVALID_STATE, unchecked) on that orphaned timer, so the edge being buffered here
+            // got no flush timer at all -- harmless for most edges (the next edge's arrival still
+            // applies it via the branch above), but fatal for the last mark of a frame, which has no
+            // next edge to rescue it before the next sync pulse's edge shows up and gets misread against
+            // a stale reference point. Calling stop() here regardless -- a no-op if nothing was armed --
+            // guarantees the start_once() below is never rejected as "already armed".
+            esp_timer_stop(this->rxNoiseTimer);
+
+            this->rxPendingValid = true;
+            this->rxPendingEdgeTicks = nowTicks;
+            this->rxPendingLevel = level;
+            esp_timer_start_once(this->rxNoiseTimer, RX_NOISE_MAX_US);
+        }
     }
 
     portEXIT_CRITICAL_ISR(&this->rxStateMux);
@@ -951,38 +988,6 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
         higherPriorityTaskWoken = (woken == pdTRUE);
     }
     return higherPriorityTaskWoken;
-}
-
-// Fires (rarely -- every PCNT_WATCH_POINT edges) when the PCNT ground-truth counter reaches its
-// watch point, well before it could ever wrap its 16-bit hardware register. Reconciles it against
-// rxIsrEdgeCount one last time, then resets both back to zero together so the per-edge compare in
-// handleReceivedEdge() can keep comparing small numbers indefinitely. Both resets happen inside the
-// same rxStateMux critical section as that per-edge compare, so it can never observe one counter
-// freshly cleared while the other is still at its old ~PCNT_WATCH_POINT value -- which would
-// otherwise read as a huge spurious divergence and force an unnecessary resync.
-bool IRAM_ATTR SX1278Driver::onPcntWatchPoint(pcnt_unit_handle_t /*unit*/, const pcnt_watch_event_data_t* edata,
-                                               void* userCtx)
-{
-    auto* self = static_cast<SX1278Driver*>(userCtx);
-    RxEvent rxEvent{};
-
-    portENTER_CRITICAL_ISR(&self->rxStateMux);
-    int32_t delta = edata->watch_point_value - self->rxIsrEdgeCount;
-    if (delta != 0)
-    {
-        rxEvent = { RxEvent::Kind::HardwareEdgeDropped, delta, self->rxState.bitCount };
-        self->rxState.phase = RxState::Phase::Idle;
-        self->rxPendingValid = false;
-    }
-    pcnt_unit_clear_count(self->rxEdgeCountUnit);
-    self->rxIsrEdgeCount = 0;
-    portEXIT_CRITICAL_ISR(&self->rxStateMux);
-
-    if (rxEvent.kind != RxEvent::Kind::None)
-    {
-        logRxEvent(rxEvent);
-    }
-    return false;
 }
 
 // Runs on the esp_timer task, RX_NOISE_MAX_US after the last edge handleReceivedEdge() buffered,

@@ -15,17 +15,17 @@
 // typedef with no tag name, so it can't be forward-declared and this can't be deferred to the .cpp.
 #include <driver/mcpwm_types.h>
 
-// Also lightweight (stdint/stdbool/esp_err.h/hal/pcnt_types.h only) -- unlike MCPWM, PCNT doesn't
-// split its handle typedefs into a separate types-only header from its function declarations, but
-// pcnt_watch_event_data_t is the same kind of anonymous-struct-typedef the callback signature
-// needs by value, so this can't be deferred to the .cpp either.
-#include <driver/pulse_cnt.h>
-
 // Avoids pulling driver/spi_master.h (and its transitive ESP-IDF includes) into every file that
 // includes this header; spi_device_handle_t is just a pointer to this struct.
 struct spi_device_t;
 // Same trick for esp_timer.h; esp_timer_handle_t is just a pointer to this struct.
 struct esp_timer;
+// Same trick for driver/pulse_cnt.h; pcnt_unit_handle_t/pcnt_channel_handle_t are just pointers to
+// these structs -- unlike mcpwm_capture_event_data_t above, PCNT's only anonymous-struct-typedef
+// (pcnt_watch_event_data_t) was solely for a watch-point callback signature this driver no longer
+// registers (see configureEdgeCounter()), so nothing here needs the full header any more.
+struct pcnt_unit_t;
+struct pcnt_chan_t;
 
 // Drives an SX1278 module over VSPI to replay Dooya remote control commands, and to decode the
 // same commands when the physical remote transmits them directly to the blind.
@@ -101,6 +101,10 @@ private:
                                   // driven count -- MCPWM's single-latch channel coalesced >=1 real
                                   // DIO2 edges into one ISR call (see configureEdgeCounter()); whatever
                                   // was in flight is abandoned and decoding resyncs on the next sync pulse
+            HardwareEdgeRecovered, // same underlying cause as HardwareEdgeDropped, but exactly one edge
+                                    // was missing and it formed a glitch pair with the still-pending
+                                    // edge (same level) -- absorbed like a normal glitch instead of
+                                    // aborting the in-progress frame; see handleReceivedEdge()
         };
         Kind kind = Kind::None;
         // For every other Kind this is a duration in microseconds; for HardwareEdgeDropped it's
@@ -128,7 +132,6 @@ private:
     static void receiverTask(void* arg);
     static bool onDio2Capture(mcpwm_cap_channel_handle_t capChannel, const mcpwm_capture_event_data_t* edata,
                                void* userCtx);
-    static bool onPcntWatchPoint(pcnt_unit_handle_t unit, const pcnt_watch_event_data_t* edata, void* userCtx);
     bool handleReceivedEdge(uint32_t nowTicks, int level);
     bool applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame, RxEvent& outEvent);
     static void noiseTimeoutCallback(void* arg);
@@ -159,6 +162,16 @@ private:
         uint8_t bitCount = 0;
         std::array<uint8_t, 5> frame{};
         uint32_t lastEdgeTicks = 0; // raw MCPWM capture-timer ticks -- see rxCaptureTicksPerUs
+        // Level of the most recent edge applyEdgeToState() actually confirmed, i.e. the DIO2 line's
+        // last known-good settled level -- -1 means none yet this session (only true right after a
+        // reset in enterReceiveMode()/transmitWaveform(), since RxState{}'s default already gives us
+        // that for free). Deliberately *not* the same thing as handleReceivedEdge()'s rxPendingLevel:
+        // that tracks the latest edge seen at all, even one still unconfirmed or one a glitch cancels
+        // out entirely -- this tracks only edges that actually happened, which is what
+        // handleReceivedEdge()'s hardware-drop recovery needs once rxPendingValid has gone false
+        // (the pending edge got applied by rxNoiseTimer, or cancelled as a glitch) but a *further*
+        // edge still needs a known-good reference level to recover against.
+        int lastEdgeLevel = -1;
     } rxState;
 
     // An edge that's been seen but not yet believed: handleReceivedEdge() holds it here instead of
@@ -189,16 +202,18 @@ private:
     uint32_t rxCaptureTicksPerUs = 1;
 
     // Ground-truth edge counter for DIO2, running in parallel with the MCPWM capture channel above:
-    // PCNT's counter register increments directly from GPIO transitions in hardware, with no per-edge
-    // CPU servicing required (only the rare, generously-spaced watch point in onPcntWatchPoint() needs
-    // one), so unlike the single-latch MCPWM capture channel it can't itself silently lose a count
-    // under interrupt-dispatch pressure. handleReceivedEdge() compares its own per-ISR-call tally
-    // (rxIsrEdgeCount) against this on every edge to detect when MCPWM capture coalesced >=2 real
-    // edges into one callback -- see configureEdgeCounter().
-    pcnt_unit_handle_t rxEdgeCountUnit = nullptr;
-    pcnt_channel_handle_t rxEdgeCountChannel = nullptr;
-    // Raw per-ISR-call edge count (glitches included, unlike rxState.bitCount). Only ever touched
-    // under rxStateMux, from handleReceivedEdge (ISR context) and onPcntWatchPoint (ISR context).
+    // PCNT's counter register increments directly from GPIO transitions in hardware, needing no
+    // interrupt/CPU servicing of its own at all (see configureEdgeCounter() -- no watch point is
+    // registered, so this unit doesn't even allocate an interrupt), so unlike the single-latch MCPWM
+    // capture channel it can't itself silently lose a count under interrupt-dispatch pressure.
+    // handleReceivedEdge() polls it on every edge, comparing it against its own per-ISR-call tally
+    // (rxIsrEdgeCount), to detect when MCPWM capture coalesced >=2 real edges into one callback.
+    pcnt_unit_t* rxEdgeCountUnit = nullptr;
+    pcnt_chan_t* rxEdgeCountChannel = nullptr;
+    // Raw per-ISR-call edge count (glitches included, unlike rxState.bitCount), periodically reset
+    // back to 0 (alongside the PCNT hardware counter) well before either could approach the 16-bit
+    // hardware register's real ceiling -- see PCNT_RESET_THRESHOLD. Only ever touched under
+    // rxStateMux, and only from handleReceivedEdge (ISR context).
     int32_t rxIsrEdgeCount = 0;
 
     portMUX_TYPE rxStateMux = portMUX_INITIALIZER_UNLOCKED;
