@@ -872,20 +872,6 @@ void SX1278Driver::senderTask(void* arg)
 
 void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
 {
-    // Stop reacting to DIO2 edges and drop out of continuous Rx before touching any packet-framing
-    // registers below, and cancel any RX edge still waiting out RX_NOISE_MAX_US (left alone, its
-    // timeout would fire mid-transmission and feed a stale edge into rxState).
-    esp_err_t err = mcpwm_capture_channel_disable(this->rxCaptureChannel);
-    if (err != ESP_OK)
-    {
-        ESP_LOGW(TAG, "Failed to disable DIO2 capture channel: %d", err);
-    }
-    esp_timer_stop(this->rxNoiseTimer);
-    portENTER_CRITICAL(&this->rxStateMux);
-    this->rxPendingValid = false;
-    this->rxLastReceivedLevel = -1;
-    portEXIT_CRITICAL(&this->rxStateMux);
-
     this->writeRegister(REG_OP_MODE, OPMODE_STANDBY);
 
     size_t total = waveform.size();
@@ -958,6 +944,19 @@ void SX1278Driver::sendNow(const std::array<uint8_t, 5>& data, uint8_t repeats)
 {
     ESP_LOGI(TAG, "Sending %02X %02X %02X %02X %02X, repeats=%d",
              data[0], data[1], data[2], data[3], data[4], repeats);
+
+    // Stop reacting to DIO2 edges and drop out of continuous Rx before touching any packet-framing
+    // registers, and cancel any RX edge still waiting out RX_NOISE_MAX_US.
+    esp_err_t err = mcpwm_capture_channel_disable(this->rxCaptureChannel);
+    if (err != ESP_OK)
+    {
+        ESP_LOGW(TAG, "Failed to disable DIO2 capture channel: %d", err);
+    }
+    esp_timer_stop(this->rxNoiseTimer);
+    portENTER_CRITICAL(&this->rxStateMux);
+    this->rxPendingValid = false;
+    this->rxLastReceivedLevel = -1;
+    portEXIT_CRITICAL(&this->rxStateMux);
 
     std::vector<uint8_t> waveform = buildWaveform(data);
 
