@@ -79,40 +79,6 @@ private:
         uint8_t repeats;
     };
 
-    // Diagnostic-only description of one RX edge-processing outcome -- either what
-    // applyEdgeToState() did with a confirmed edge, or a glitch handleReceivedEdge() discarded
-    // before the edge ever reached applyEdgeToState(). It's an out-parameter rather than logged
-    // directly at the point of detection because every caller runs under rxStateMux (ISR-disabled
-    // critical section from handleReceivedEdge, interrupts-disabled critical section from
-    // noiseTimeoutCallback) -- logging while holding that lock would stall the other core for
-    // however long the print takes. Callers log it via logRxEvent() only after releasing the lock.
-    struct RxEvent
-    {
-        enum class Kind : uint8_t
-        {
-            None,
-            GlitchDropped,    // two edges arrived within RX_NOISE_MAX_US of each other while InFrame; both
-                              // discarded as noise (only reported mid-frame -- see handleReceivedEdge)
-            SyncDetected,     // a mark in the sync-length range was seen
-            SyncAbortedFrame, // ...and it interrupted an already in-progress frame, dropping it
-            GapInvalid,       // the post-sync low gap didn't match, dropped before any bits
-            BitInvalid,       // a mark matched neither the short nor long band, dropped mid-frame
-            HardwareEdgeDropped, // the PCNT ground-truth edge counter diverged from the MCPWM-capture-
-                                  // driven count -- MCPWM's single-latch channel coalesced >=1 real
-                                  // DIO2 edges into one ISR call (see configureEdgeCounter()); whatever
-                                  // was in flight is abandoned and decoding resyncs on the next sync pulse
-            HardwareEdgeRecovered, // same underlying cause as HardwareEdgeDropped, but exactly one edge
-                                    // was missing and it formed a glitch pair with the still-pending
-                                    // edge (same level) -- absorbed like a normal glitch instead of
-                                    // aborting the in-progress frame; see handleReceivedEdge()
-        };
-        Kind kind = Kind::None;
-        // For every other Kind this is a duration in microseconds; for HardwareEdgeDropped it's
-        // repurposed as the raw edge-count delta (PCNT count minus software count) instead.
-        int64_t durationUs = 0;
-        uint8_t bitCount = 0; // bits collected so far, for GlitchDropped/AbortedFrame/BitInvalid
-    };
-
     void resetChip();
     static void dio2SetupTask(void* arg);
     void configureEdgeCounter();
@@ -133,9 +99,8 @@ private:
     static bool onDio2Capture(mcpwm_cap_channel_handle_t capChannel, const mcpwm_capture_event_data_t* edata,
                                void* userCtx);
     bool handleReceivedEdge(uint32_t nowTicks, int level);
-    bool applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame, RxEvent& outEvent);
+    bool applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame);
     static void noiseTimeoutCallback(void* arg);
-    static void logRxEvent(const RxEvent& event);
 
     spi_device_t* spiDevice = nullptr;
     QueueHandle_t commandQueue = nullptr;
