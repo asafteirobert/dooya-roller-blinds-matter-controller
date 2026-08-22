@@ -19,8 +19,6 @@
 
 namespace
 {
-static const DRAM_ATTR char ISR_LOG_TAG[] = "SX1278Driver";
-
 // --- OOK/PWM timing
 constexpr uint32_t SYNC_US = 4600;
 constexpr uint32_t SHORT_US = 350; // logical bit 0
