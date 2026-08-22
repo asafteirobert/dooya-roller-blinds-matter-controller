@@ -156,17 +156,17 @@ public:
     {
         for (uint32_t i = 0; i < chipCount; ++i)
         {
-            size_t byteIndex = bitCount_ / 8;
-            uint8_t bitIndex = 7 - static_cast<uint8_t>(bitCount_ % 8);
-            if (byteIndex == buffer_.size())
+            size_t byteIndex = this->bitCount_ / 8;
+            uint8_t bitIndex = 7 - static_cast<uint8_t>(this->bitCount_ % 8);
+            if (byteIndex == this->buffer_.size())
             {
-                buffer_.push_back(0);
+                this->buffer_.push_back(0);
             }
             if (level)
             {
-                buffer_[byteIndex] |= static_cast<uint8_t>(1u << bitIndex);
+                this->buffer_[byteIndex] |= static_cast<uint8_t>(1u << bitIndex);
             }
-            ++bitCount_;
+            ++this->bitCount_;
         }
     }
 
@@ -398,34 +398,34 @@ void SX1278Driver::writeFifo(const uint8_t* data, size_t length)
 void SX1278Driver::configureRadio()
 {
     // LongRangeMode can only change while the *target* mode is Sleep, so force that first.
-    writeRegister(REG_OP_MODE, 0x00);
-    writeRegister(REG_OP_MODE, OPMODE_SLEEP);
-    writeRegister(REG_OP_MODE, OPMODE_STANDBY);
+    this->writeRegister(REG_OP_MODE, 0x00);
+    this->writeRegister(REG_OP_MODE, OPMODE_SLEEP);
+    this->writeRegister(REG_OP_MODE, OPMODE_STANDBY);
     vTaskDelay(pdMS_TO_TICKS(10)); // crystal oscillator startup
 
     uint32_t frf = static_cast<uint32_t>((RF_FREQUENCY_HZ * 524288.0) / FXOSC_HZ + 0.5);
-    writeRegister(REG_FRF_MSB, static_cast<uint8_t>(frf >> 16));
-    writeRegister(REG_FRF_MID, static_cast<uint8_t>(frf >> 8));
-    writeRegister(REG_FRF_LSB, static_cast<uint8_t>(frf));
+    this->writeRegister(REG_FRF_MSB, static_cast<uint8_t>(frf >> 16));
+    this->writeRegister(REG_FRF_MID, static_cast<uint8_t>(frf >> 8));
+    this->writeRegister(REG_FRF_LSB, static_cast<uint8_t>(frf));
 
     // Bit rate sets the on-air duration of a single chip in our hand-encoded waveform; it has
     // nothing to do with any "real" data rate.
     uint32_t bitRateReg = static_cast<uint32_t>(FXOSC_HZ / BIT_RATE_BPS + 0.5);
-    writeRegister(REG_BITRATE_MSB, static_cast<uint8_t>(bitRateReg >> 8));
-    writeRegister(REG_BITRATE_LSB, static_cast<uint8_t>(bitRateReg));
+    this->writeRegister(REG_BITRATE_MSB, static_cast<uint8_t>(bitRateReg >> 8));
+    this->writeRegister(REG_BITRATE_LSB, static_cast<uint8_t>(bitRateReg));
 
     // PA_BOOST pin, max output power (+17dBm). No modulation shaping: shaping would low-pass
     // filter the OOK edges, blurring the exact pulse widths this protocol depends on.
-    writeRegister(REG_PA_CONFIG, 0x80 | 0x0F);
-    writeRegister(REG_PA_RAMP, 0x08); // ModulationShaping=00 (none), PaRamp=50us
+    this->writeRegister(REG_PA_CONFIG, 0x80 | 0x0F);
+    this->writeRegister(REG_PA_RAMP, 0x08); // ModulationShaping=00 (none), PaRamp=50us
 
     // No preamble/sync word/CRC: the FIFO payload streamed in transmitWaveform() *is* the exact
     // on-air waveform, byte for byte.
-    writeRegister(REG_PREAMBLE_MSB, 0x00);
-    writeRegister(REG_PREAMBLE_LSB, 0x00);
-    writeRegister(REG_SYNC_CONFIG, 0x00);    // SyncOn=0
-    writeRegister(REG_PACKET_CONFIG1, 0x00); // fixed length, DcFree=none, CrcOn=0
-    writeRegister(REG_FIFO_THRESH, FIFO_THRESHOLD); // TxStartCondition=0 (wait for FifoLevel)
+    this->writeRegister(REG_PREAMBLE_MSB, 0x00);
+    this->writeRegister(REG_PREAMBLE_LSB, 0x00);
+    this->writeRegister(REG_SYNC_CONFIG, 0x00);    // SyncOn=0
+    this->writeRegister(REG_PACKET_CONFIG1, 0x00); // fixed length, DcFree=none, CrcOn=0
+    this->writeRegister(REG_FIFO_THRESH, FIFO_THRESHOLD); // TxStartCondition=0 (wait for FifoLevel)
 }
 
 // One-time OOK receiver setup, independent of the Tx/Rx DataMode toggle in
@@ -434,7 +434,7 @@ void SX1278Driver::configureReceiver()
 {
     // BitSyncOn=0 (no preamble for the bit synchronizer to lock onto -- we need the raw envelope,
     // not a recovered bit clock), OokThreshType=01 (Peak, recommended default).
-    writeRegister(REG_OOK_PEAK, 0x08);
+    this->writeRegister(REG_OOK_PEAK, 0x08);
 
     // single-side channel filter bandwidth
     // Value	Mant	Exp	Bandwidth
@@ -448,21 +448,21 @@ void SX1278Driver::configureReceiver()
     // 0x13	    24	    3	41.7 kHz
     // 0x0A	    20	    2	100 kHz
     // 0x12	    24	    2	83.3 kHz
-    writeRegister(REG_RX_BW, 0x16);
+    this->writeRegister(REG_RX_BW, 0x16);
 
     // Floor threshold for the OOK Peak demodulator, board/environment-specific -- datasheet
     // section 2.1.3.2 recommends raising it until DIO2 stops toggling with no transmitter active.
     // This is only a conservative starting point; tune live via `sx1278reg 0x15 <value>`.
-    writeRegister(REG_OOK_FIX, 0x4D);
+    this->writeRegister(REG_OOK_FIX, 0x4D);
 
     // AgcAutoOn=1, RxTrigger=001 (Rssi interrupt): LNA gain reconverges whenever RSSI crosses the
     // threshold, i.e. whenever a transmission begins after a silent gap.
-    writeRegister(REG_RX_CONFIG, 0x09);
+    this->writeRegister(REG_RX_CONFIG, 0x09);
 }
 
 void SX1278Driver::init()
 {
-    resetChip();
+    this->resetChip();
 
     // See dio2SetupTask(): runs the MCPWM/PCNT setup from core 1. Blocks until it signals
     // completion so init() stays synchronous from app_main.cpp's perspective.
@@ -473,7 +473,7 @@ void SX1278Driver::init()
     xSemaphoreTake(dio2SetupDone, portMAX_DELAY);
     vSemaphoreDelete(dio2SetupDone);
 
-    configureDebugPins();
+    this->configureDebugPins();
 
     spi_bus_config_t busConfig = {};
     busConfig.mosi_io_num = GPIO_NUM_23;
@@ -500,7 +500,7 @@ void SX1278Driver::init()
         return;
     }
 
-    uint8_t version = readRegister(REG_VERSION);
+    uint8_t version = this->readRegister(REG_VERSION);
     ESP_LOGI(TAG, "SX1278 RegVersion=0x%02X", version);
     if (version == 0x00 || version == 0xFF)
     {
@@ -509,8 +509,8 @@ void SX1278Driver::init()
         return;
     }
 
-    configureRadio();
-    configureReceiver();
+    this->configureRadio();
+    this->configureReceiver();
     ESP_LOGI(TAG, "SX1278 initialised");
 
     this->commandQueue = xQueueCreate(COMMAND_QUEUE_LENGTH, sizeof(QueuedCommand));
@@ -533,9 +533,9 @@ void SX1278Driver::init()
 // decode the next frame from scratch. Called once at startup and again after every transmission.
 void SX1278Driver::enterReceiveMode()
 {
-    writeRegister(REG_PACKET_CONFIG2, PACKET_CONFIG2_DATA_MODE_CONTINUOUS);
-    writeRegister(REG_OP_MODE, OPMODE_STANDBY);
-    writeRegister(REG_OP_MODE, OPMODE_RX_CONTINUOUS);
+    this->writeRegister(REG_PACKET_CONFIG2, PACKET_CONFIG2_DATA_MODE_CONTINUOUS);
+    this->writeRegister(REG_OP_MODE, OPMODE_STANDBY);
+    this->writeRegister(REG_OP_MODE, OPMODE_RX_CONTINUOUS);
 
     esp_timer_stop(this->rxNoiseTimer); // no-op (ignored error) if nothing was pending
 
@@ -577,7 +577,7 @@ bool SX1278Driver::peekRegister(uint8_t address, uint8_t& outValue)
     {
         return false;
     }
-    outValue = readRegister(address);
+    outValue = this->readRegister(address);
     return true;
 }
 
@@ -587,14 +587,14 @@ bool SX1278Driver::pokeRegister(uint8_t address, uint8_t value)
     {
         return false;
     }
-    writeRegister(address, value);
+    this->writeRegister(address, value);
     return true;
 }
 
 bool SX1278Driver::peekRssiDbm(double& outDbm)
 {
     uint8_t rssiValue = 0;
-    if (!peekRegister(REG_RSSI_VALUE, rssiValue))
+    if (!this->peekRegister(REG_RSSI_VALUE, rssiValue))
     {
         return false;
     }
@@ -886,12 +886,12 @@ void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
     this->rxLastReceivedLevel = -1;
     portEXIT_CRITICAL(&this->rxStateMux);
 
-    writeRegister(REG_OP_MODE, OPMODE_STANDBY);
+    this->writeRegister(REG_OP_MODE, OPMODE_STANDBY);
 
     size_t total = waveform.size();
 
-    writeRegister(REG_PACKET_CONFIG2, PACKET_CONFIG2_DATA_MODE_PACKET | static_cast<uint8_t>((total >> 8) & 0x07));
-    writeRegister(REG_PAYLOAD_LENGTH, static_cast<uint8_t>(total & 0xFF));
+    this->writeRegister(REG_PACKET_CONFIG2, PACKET_CONFIG2_DATA_MODE_PACKET | static_cast<uint8_t>((total >> 8) & 0x07));
+    this->writeRegister(REG_PAYLOAD_LENGTH, static_cast<uint8_t>(total & 0xFF));
 
     // Pre-fill the FIFO before enabling Tx, per the datasheet's "Handling Large Packets" sequence.
     size_t sent = 0;
@@ -899,11 +899,11 @@ void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
     while (sent < preload)
     {
         size_t chunk = std::min(preload - sent, FIFO_CHUNK);
-        writeFifo(waveform.data() + sent, chunk);
+        this->writeFifo(waveform.data() + sent, chunk);
         sent += chunk;
     }
 
-    writeRegister(REG_OP_MODE, OPMODE_TX);
+    this->writeRegister(REG_OP_MODE, OPMODE_TX);
 
     int64_t deadline = esp_timer_get_time() + FIFO_WAIT_TIMEOUT_US;
     while (sent < total)
@@ -911,14 +911,14 @@ void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
         if (gpio_get_level(SX1278_DIO1_GPIO) == 0) // FifoLevel cleared: level has drained to the threshold
         {
             size_t chunk = std::min(total - sent, FIFO_CHUNK);
-            writeFifo(waveform.data() + sent, chunk);
+            this->writeFifo(waveform.data() + sent, chunk);
             sent += chunk;
             deadline = esp_timer_get_time() + FIFO_WAIT_TIMEOUT_US;
         }
         else if (esp_timer_get_time() > deadline)
         {
             ESP_LOGE(TAG, "Timed out refilling SX1278 FIFO, aborting transmission");
-            writeRegister(REG_OP_MODE, OPMODE_STANDBY);
+            this->writeRegister(REG_OP_MODE, OPMODE_STANDBY);
             return;
         }
     }
@@ -933,7 +933,7 @@ void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
         }
     }
 
-    writeRegister(REG_OP_MODE, OPMODE_STANDBY);
+    this->writeRegister(REG_OP_MODE, OPMODE_STANDBY);
 }
 
 void SX1278Driver::send(const std::array<uint8_t, 5>& data, uint8_t repeats)
@@ -963,7 +963,7 @@ void SX1278Driver::sendNow(const std::array<uint8_t, 5>& data, uint8_t repeats)
 
     for (uint8_t i = 0; i < repeats; ++i)
     {
-        transmitWaveform(waveform);
+        this->transmitWaveform(waveform);
         if (i + 1 < repeats)
         {
             esp_rom_delay_us(RESET_US);

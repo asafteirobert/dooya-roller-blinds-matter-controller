@@ -38,7 +38,7 @@ void BlindController::init(RadioController &radioController, PositionChangedCall
 
 void BlindController::moveTo(uint8_t percentage)
 {
-    moveToInternal(percentage, true);
+    this->moveToInternal(percentage, true);
 }
 
 void BlindController::handleRemoteCommand(RadioController::Command command)
@@ -46,13 +46,13 @@ void BlindController::handleRemoteCommand(RadioController::Command command)
     switch (command)
     {
     case RadioController::Command::UP:
-        moveToInternal(0, false);
+        this->moveToInternal(0, false);
         break;
     case RadioController::Command::DOWN:
-        moveToInternal(100, false);
+        this->moveToInternal(100, false);
         break;
     case RadioController::Command::STOP:
-        stopInternal(false);
+        this->stopInternal(false);
         break;
     }
 }
@@ -80,8 +80,8 @@ void BlindController::moveToInternal(uint8_t percentage, bool sendRadioCommand)
     // what to do next, and cancel the pending STOP for the old target.
     if (this->direction != Direction::NONE)
     {
-        cancelStopTimerLocked();
-        syncPercentageToElapsedTravelLocked();
+        this->cancelStopTimerLocked();
+        this->syncPercentageToElapsedTravelLocked();
     }
 
     this->targetPercentage = percentage;
@@ -140,7 +140,7 @@ void BlindController::moveToInternal(uint8_t percentage, bool sendRadioCommand)
 
 void BlindController::stop()
 {
-    stopInternal(true);
+    this->stopInternal(true);
 }
 
 void BlindController::stopInternal(bool sendRadioCommand)
@@ -150,8 +150,8 @@ void BlindController::stopInternal(bool sendRadioCommand)
     bool wasMoving = (this->direction != Direction::NONE);
     if (wasMoving)
     {
-        cancelStopTimerLocked();
-        syncPercentageToElapsedTravelLocked();
+        this->cancelStopTimerLocked();
+        this->syncPercentageToElapsedTravelLocked();
 
         ESP_LOGI(TAG, "Blind %d: stop requested at %d%%", this->blindRadioChannel, this->currentPercentage);
         if (sendRadioCommand)
