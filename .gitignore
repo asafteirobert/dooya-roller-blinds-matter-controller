@@ -3,3 +3,4 @@
 node_modules/
 tools/write-blind-config/package-lock.json
 sdkconfig.old
+mfg-tool-scripts/out/
