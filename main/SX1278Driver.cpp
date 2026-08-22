@@ -589,6 +589,7 @@ void SX1278Driver::enterReceiveMode()
     portENTER_CRITICAL(&this->rxStateMux);
     this->rxState = RxState{};
     this->rxPendingValid = false;
+    this->rxLastReceivedLevel = -1;
     if (this->rxEdgeCountUnit != nullptr)
     {
         pcnt_unit_clear_count(this->rxEdgeCountUnit);
@@ -860,6 +861,31 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
 
     portENTER_CRITICAL_ISR(&this->rxStateMux);
 
+    // Spurious duplicate dispatch: MCPWM's capture interrupt is registered via
+    // esp_intr_alloc_intrstatus's shared-interrupt mechanism, which re-reads the group's raw status
+    // register fresh every time the underlying interrupt vector fires (see shared_intr_isr() in
+    // esp-idf's intr_alloc.c). mcpwm_capture_default_isr() clears its status bit with a plain write
+    // and only then reads the separate cap_value/cap_edge latch registers -- if that clear hasn't
+    // yet propagated through to the status register by the time the vector re-triggers (more likely
+    // under the tight back-to-back timing a real glitch produces), the still-set bit causes a
+    // second, spurious call to this function with byte-for-byte identical cap_value/cap_edge, since
+    // no new electrical edge actually happened. A genuine edge can, for all practical purposes,
+    // never land on the exact same capture-timer tick as the previous one, so comparing nowTicks
+    // against rxLastReceivedTicks -- the very last edge this function was actually called with, kept
+    // up to date regardless of whether that edge was applied, buffered, or discarded as a glitch --
+    // reliably tells the two apart. (rxPendingEdgeTicks/rxState.lastEdgeTicks are NOT substitutes for
+    // this: a glitch-cancelled edge updates neither, so right after a glitch is skipped they'd still
+    // point at whatever edge came before it, missing a duplicate of the just-cancelled one entirely.)
+    // Bail out before touching rxIsrEdgeCount/PCNT at all, so the duplicate can't masquerade as a
+    // hardware-dropped edge (the spurious negative-delta HardwareEdgeDropped this was producing).
+    if (this->rxLastReceivedLevel != -1 && nowTicks == this->rxLastReceivedTicks && level == this->rxLastReceivedLevel)
+    {
+        portEXIT_CRITICAL_ISR(&this->rxStateMux);
+        return false;
+    }
+    this->rxLastReceivedTicks = nowTicks;
+    this->rxLastReceivedLevel = level;
+
     ++this->rxIsrEdgeCount;
     // Set when the PCNT reconciliation below fully accounts for this edge itself (see the
     // HardwareEdgeRecovered case) -- the normal glitch/apply logic further down must not also run
@@ -1057,6 +1083,7 @@ void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
     esp_timer_stop(this->rxNoiseTimer);
     portENTER_CRITICAL(&this->rxStateMux);
     this->rxPendingValid = false;
+    this->rxLastReceivedLevel = -1;
     portEXIT_CRITICAL(&this->rxStateMux);
 
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);

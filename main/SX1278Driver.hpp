@@ -185,6 +185,15 @@ private:
     int rxPendingLevel = 0;
     struct esp_timer* rxNoiseTimer = nullptr;
 
+    // The very last edge handleReceivedEdge() actually received from the MCPWM capture ISR,
+    // regardless of what was subsequently done with it -- applied, buffered as rxPending*, or
+    // discarded outright as a glitch (which, unlike rxPending*/rxState.lastEdge*, leaves no other
+    // trace of the edge anywhere once it's cancelled). Used purely to detect a spurious duplicate
+    // redispatch of the same underlying hardware capture event before it can be mistaken for a new
+    // one -- see the comment in handleReceivedEdge(). -1 means none received yet this session.
+    uint32_t rxLastReceivedTicks = 0;
+    int rxLastReceivedLevel = -1;
+
     // Hardware edge timing for DIO2: the MCPWM capture channel latches (tick count, edge polarity)
     // atomically at the instant of the electrical edge, so onDio2Capture()'s timestamp can't be
     // corrupted by ISR scheduling delay the way a software esp_timer_get_time() read could be --
