@@ -72,7 +72,7 @@ void RadioController::onFrameReceived(const std::array<uint8_t, 5>& data)
     for (uint8_t i = 0; i < this->registeredBlindCount; ++i)
     {
         BlindController* blind = this->registeredBlinds[i];
-        if (blind->blindRemoteId == remoteId && blind->blindRadioChannel == channel)
+        if (blind->blindRemoteId == remoteId && (blind->blindRadioChannel == channel || channel == 0))
         {
             blind->handleRemoteCommand(command);
             return;
