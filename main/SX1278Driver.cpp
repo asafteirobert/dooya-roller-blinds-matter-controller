@@ -42,10 +42,9 @@ constexpr uint32_t BIT_RATE_BPS = 1000000 / SAMPLE_US; // one on-air bit == one 
 
 constexpr int SPI_CLOCK_HZ = 4 * 1000 * 1000; // conservative for hobby-wired breakout boards
 
-// The SX1278's FSK/OOK FIFO is only 64 bytes deep, so any payload longer than that (ours always
-// is) must be streamed in while transmitting, per the "Handling Large Packets" procedure in the
-// datasheet: pre-fill, enable Tx, then keep topping up in FIFO_CHUNK-sized bursts whenever the
-// FifoLevel flag (mirrored on DIO1) says the level has dropped back to the threshold.
+// The FIFO is only 64 bytes deep, so any payload longer than that (ours always is) is streamed in
+// while transmitting per the datasheet's "Handling Large Packets" procedure: pre-fill, enable Tx,
+// then top up in FIFO_CHUNK bursts whenever FifoLevel (mirrored on DIO1) drops to the threshold.
 constexpr size_t FIFO_CAPACITY = 64;
 constexpr size_t FIFO_CHUNK = 32;
 constexpr uint8_t FIFO_THRESHOLD = FIFO_CAPACITY - FIFO_CHUNK; // leaves exactly one chunk of headroom
@@ -60,21 +59,17 @@ constexpr UBaseType_t SENDER_TASK_PRIORITY = 5;
 // Minimum gap between the end of one queued command and the start of the next
 constexpr uint32_t COMMAND_GAP_MS = 200;
 
-// Deep enough to absorb a burst of repeated button presses (real remotes send several repeats
-// per press) without the ISR ever blocking or dropping a decoded frame.
+// Deep enough to absorb a burst of repeated button presses without the ISR ever blocking/dropping.
 constexpr UBaseType_t RX_FRAME_QUEUE_LENGTH = 8;
 constexpr uint32_t RECEIVER_TASK_STACK_WORDS = 4096;
 constexpr UBaseType_t RECEIVER_TASK_PRIORITY = 5;
 
-// dio2SetupTask() runs configureEdgeCounter()/configureDioPins() from core 1 instead of directly
-// from init() (core 0), so the MCPWM capture and PCNT interrupts esp_intr_alloc() registers inside
-// those calls bind to core 1 -- away from WiFi/BLE's own interrupt dispatch, both pinned to core 0
-// (see the comment in configureDioPins() this was written to address).
+// dio2SetupTask() runs the MCPWM/PCNT setup from core 1 (see there) so their interrupts bind away
+// from WiFi/BLE's dispatch, which is pinned to core 0.
 constexpr uint32_t DIO2_SETUP_TASK_STACK_WORDS = 3072;
 constexpr UBaseType_t DIO2_SETUP_TASK_PRIORITY = 5;
 constexpr BaseType_t DIO2_SETUP_CORE = 1;
 
-// Passed into dio2SetupTask() as its FreeRTOS task argument.
 struct Dio2SetupContext
 {
     SX1278Driver* driver;
@@ -84,25 +79,16 @@ struct Dio2SetupContext
 // ESP32's PCNT counter register is a signed 16-bit field.
 constexpr int PCNT_LOW_LIMIT = -32768;
 constexpr int PCNT_HIGH_LIMIT = 32767;
-// handleReceivedEdge() resets rxIsrEdgeCount (and the PCNT hardware counter alongside it) back to 0
-// once it reaches this, well before either could approach the hardware ceiling above -- see there.
-// Plain threshold, not a hardware watch point, so there's no exact-value-match concern; any value
-// comfortably below PCNT_HIGH_LIMIT is safe.
+// handleReceivedEdge() resets rxIsrEdgeCount (and the PCNT counter) back to 0 once it reaches this,
+// well below the hardware ceiling above -- see there. Any value comfortably below the ceiling works.
 constexpr int PCNT_RESET_THRESHOLD = 20000;
 
-// --- OOK/PWM RX decode tolerances, mirroring buildWaveform()'s encoding in reverse. Only the
-// duration of each HIGH ("mark") run is used to decode a bit -- LONG_US means 1, SHORT_US means
-// 0 -- since buildWaveform() always pairs a mark with the complementary-length space to keep the
-// bit period constant, so the space carries no extra information.
-//
-// Every classification band below is separated from its neighbours by a dead zone that belongs to
-// neither: a duration landing in a gap aborts the in-progress frame (see handleReceivedEdge)
-// instead of being forced into whichever band happens to be closest. Without that gap, jitter that
-// pushes a single mark across a boundary silently flips that bit instead of dropping the frame --
-// this is what let corrupted-but-well-formed frames (right length, wrong bit) through and produced
-// commands with a plausible-looking but wrong remote ID. A dropped frame is harmless: the remote
-// repeats every button press several times and RadioController only needs one good frame to get
-// through.
+// --- OOK/PWM RX decode tolerances, mirroring buildWaveform()'s encoding in reverse. Only each
+// HIGH ("mark") run's duration is decoded -- LONG_US means 1, SHORT_US means 0 -- since the
+// complementary space carries no extra information. Each band is separated from its neighbours by
+// a dead zone: a duration landing in a gap aborts the in-progress frame (see handleReceivedEdge)
+// instead of being forced into the nearest band, so jitter can't silently flip a bit into a
+// plausible-but-wrong frame. A dropped frame is harmless -- the remote repeats every press.
 constexpr int64_t RX_SHORT_MIN_US = 180;
 constexpr int64_t RX_SHORT_MAX_US = 460; // SHORT_US(350) + ~31%
 constexpr int64_t RX_LONG_MIN_US = 590;  // LONG_US(700) - ~16% -- 130us dead zone vs RX_SHORT_MAX_US
@@ -111,18 +97,13 @@ constexpr int64_t RX_SYNC_MIN_US = 2800; // SYNC_US(4600) - ~39%, comfortably ab
 constexpr int64_t RX_SYNC_MAX_US = 6200; // SYNC_US(4600) + ~35%
 constexpr uint8_t RX_FRAME_BITS = 40;
 
-// Below RX_SHORT_MIN_US by a wide margin, so a run this brief can never be a real mark or space --
-// it's an RF/electrical glitch on DIO2. An edge is only applied to rxState once it has survived
-// this long without a second edge closing it (see handleReceivedEdge()/rxPendingValid), so a spike
-// that dips high->low->high or low->high->low within this window never reaches the state machine
-// on either edge; the run it interrupted is read as one continuous run instead of two.
+// Below RX_SHORT_MIN_US by a wide margin, so a run this brief is always an RF/electrical glitch,
+// never a real mark or space -- see rxPendingValid.
 constexpr int64_t RX_NOISE_MAX_US = 50;
 
 // The sync mark is always followed by a fixed 2*LONG_US (1400us) low gap before the first bit's
-// mark starts (see buildWaveform()). Requiring that gap to also match before committing to
-// "in frame" makes a random noise glitch that happens to land in the SYNC_US window (rare on its
-// own) need a *second* coincidence to be mistaken for a real frame, which is what lets a weak
-// real signal be told apart from noise reliably instead of just by luck.
+// mark (see buildWaveform()). Requiring that gap to also match before committing to "in frame"
+// needs a noise glitch to land in *two* independent windows to be mistaken for a real frame.
 constexpr int64_t RX_POST_SYNC_GAP_MIN_US = 1050;
 constexpr int64_t RX_POST_SYNC_GAP_MAX_US = 1850;
 
@@ -159,15 +140,13 @@ constexpr uint8_t OPMODE_STANDBY = MODULATION_OOK_LF | 0x01;
 constexpr uint8_t OPMODE_TX = MODULATION_OOK_LF | 0x03;
 constexpr uint8_t OPMODE_RX_CONTINUOUS = MODULATION_OOK_LF | 0x05;
 
-// RegPacketConfig2: DataMode=1 (Packet, used for Tx) vs. DataMode=0 (Continuous, used for Rx --
-// our protocol has no SX1278-recognised preamble/sync word for the packet engine to frame it
-// with, so DIO2 is read as a raw envelope and decoded in software instead; see
-// handleReceivedEdge).
+// RegPacketConfig2 DataMode: Packet for Tx, Continuous for Rx (our protocol has no SX1278-framable
+// preamble/sync word, so DIO2 is read as a raw envelope and decoded in software instead).
 constexpr uint8_t PACKET_CONFIG2_DATA_MODE_PACKET = 0x40;
 constexpr uint8_t PACKET_CONFIG2_DATA_MODE_CONTINUOUS = 0x00;
 
 // Appends single-value-per-chip runs to a byte buffer, MSB-first, matching the bit order the
-// SX1278 shifts a FIFO byte out in 
+// SX1278 shifts a FIFO byte out in.
 class BitWriter
 {
 public:
@@ -197,8 +176,7 @@ private:
 };
 
 // Encodes the 40-bit Dooya command into the literal on-air OOK waveform for a single frame
-// (sync + 40 bits, each chip SAMPLE_US wide). See the header-file comment for the short/long/invert
-// derivation.
+// (sync + 40 bits, each chip SAMPLE_US wide).
 std::vector<uint8_t> buildWaveform(const std::array<uint8_t, 5>& data)
 {
     std::vector<uint8_t> waveform;
@@ -213,8 +191,7 @@ std::vector<uint8_t> buildWaveform(const std::array<uint8_t, 5>& data)
         for (int bitIndex = 7; bitIndex >= 0; --bitIndex)
         {
             bool bit = (byte >> bitIndex) & 0x01;
-            // Mark and space swap between LONG/SHORT so every bit takes the same
-            // SHORT_CHIPS+LONG_CHIPS total time regardless of its value.
+            // Mark and space swap between LONG/SHORT so every bit takes the same total time.
             writer.appendRun(true, bit ? LONG_CHIPS : SHORT_CHIPS);
             writer.appendRun(false, !bit ? LONG_CHIPS : SHORT_CHIPS);
         }
@@ -241,18 +218,14 @@ void SX1278Driver::resetChip()
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
-// Sets up the PCNT ground-truth edge counter for DIO2 -- see the header comment on rxEdgeCountUnit.
-// Must run before configureDioPins(): pcnt_new_channel() unconditionally force-enables DIO2's
-// internal pull-up (its own doc comment: "input mode with pull up enabled"), and configureDioPins()'s
-// mcpwm_new_capture_channel() call explicitly disables it again (pull_up=false, matching
-// GPIO_PULLUP_DISABLE elsewhere) -- so that disable must be the one that runs last.
+// Sets up the PCNT ground-truth edge counter for DIO2 -- see rxEdgeCountUnit in the header. Must
+// run before configureDioPins(): pcnt_new_channel() force-enables DIO2's pull-up, and
+// configureDioPins()'s mcpwm_new_capture_channel() disables it again, so that disable must run last.
 void SX1278Driver::configureEdgeCounter()
 {
     pcnt_unit_config_t unitConfig = {};
     unitConfig.low_limit = PCNT_LOW_LIMIT;
     unitConfig.high_limit = PCNT_HIGH_LIMIT;
-    // No intr_priority to set: this unit registers no watch point/event callback below, so it never
-    // allocates an interrupt at all -- handleReceivedEdge() only ever polls its count directly.
     esp_err_t err = pcnt_new_unit(&unitConfig, &this->rxEdgeCountUnit);
     if (err != ESP_OK)
     {
@@ -261,7 +234,7 @@ void SX1278Driver::configureEdgeCounter()
     }
 
     // No glitch filter: this counter must match MCPWM capture's raw per-ISR-call count 1:1,
-    // including the noise glitches handleReceivedEdge()'s own buffering later filters out.
+    // including the noise glitches handleReceivedEdge() later filters out.
     pcnt_chan_config_t chanConfig = {};
     chanConfig.edge_gpio_num = SX1278_DIO2_GPIO;
     chanConfig.level_gpio_num = -1;
@@ -285,16 +258,13 @@ void SX1278Driver::configureEdgeCounter()
         return;
     }
     pcnt_unit_clear_count(this->rxEdgeCountUnit);
-    // Deliberately not calling pcnt_unit_start() here -- enterReceiveMode()/transmitWaveform() start
-    // and stop it in lockstep with the MCPWM capture channel, same pattern as
-    // mcpwm_capture_channel_enable()/disable().
+    // Not started here -- enterReceiveMode()/transmitWaveform() start/stop it in lockstep with the
+    // MCPWM capture channel.
 }
 
 // Runs configureEdgeCounter()/configureDioPins() from a task pinned to core 1 instead of directly
-// from init() (which runs on core 0, see app_main.cpp), so the interrupts esp_intr_alloc() registers
-// inside those two calls bind to core 1 instead of contending with WiFi/BLE's own interrupt dispatch
-// on core 0 -- see the DIO2_SETUP_* comment above. init() blocks on doneSemaphore so it stays
-// synchronous from its caller's perspective; this task deletes itself once done.
+// from init() (core 0), so the interrupts they register bind to core 1 instead of contending with
+// WiFi/BLE on core 0 -- see DIO2_SETUP_* above. init() blocks on doneSemaphore to stay synchronous.
 void SX1278Driver::dio2SetupTask(void* arg)
 {
     auto* context = static_cast<Dio2SetupContext*>(arg);
@@ -306,8 +276,8 @@ void SX1278Driver::dio2SetupTask(void* arg)
 
 void SX1278Driver::configureDioPins()
 {
-    // DIO0 = PacketSent, DIO1 = FifoLevel in Tx/packet mode -- both are the default DioMapping
-    // (RegDioMapping1 reset value 0x00), so only the GPIO direction needs configuring here.
+    // DIO0 = PacketSent, DIO1 = FifoLevel in Tx/packet mode -- both are the default DioMapping, so
+    // only the GPIO direction needs configuring here.
     gpio_config_t dioConfig = {};
     dioConfig.pin_bit_mask = (1ULL << SX1278_DIO0_GPIO) | (1ULL << SX1278_DIO1_GPIO);
     dioConfig.mode = GPIO_MODE_INPUT;
@@ -316,23 +286,18 @@ void SX1278Driver::configureDioPins()
     dioConfig.intr_type = GPIO_INTR_DISABLE;
     gpio_config(&dioConfig);
 
-    // DIO2 = Data: with DataMode=Continuous (entered only while receiving, see
-    // enterReceiveMode()) this pin mirrors the raw OOK-demodulated envelope in real time. Every
-    // edge is timestamped in hardware by the MCPWM capture peripheral -- the tick count and edge
-    // polarity are latched atomically at the instant of the electrical edge, so the timestamp
-    // handleReceivedEdge() sees can't be corrupted by ISR scheduling delay the way a software
-    // esp_timer_get_time() read from inside a GPIO ISR could be (WiFi/BLE, both pinned to core 0
-    // alongside this driver's own init, run higher-priority interrupts that can preempt a level-1
-    // GPIO ISR for long enough to badly misreport an edge's time -- this used to produce spurious
-    // multi-millisecond gaps that broke frame decoding). The capture channel starts disabled since
-    // DIO2's meaning while transmitting/mid-configuration is undefined; enterReceiveMode() is what
-    // turns it on.
+    // DIO2 = Data: in DataMode=Continuous (receive only) this pin mirrors the raw OOK-demodulated
+    // envelope. Every edge is timestamped by the MCPWM capture peripheral, latched atomically in
+    // hardware so the timestamp can't be corrupted by ISR scheduling delay the way a software
+    // esp_timer_get_time() read could be under WiFi/BLE interrupt pressure (both pinned to core 0
+    // alongside this driver's init) -- that used to produce spurious multi-millisecond gaps that
+    // broke frame decoding. Starts disabled since DIO2's meaning while transmitting is undefined;
+    // enterReceiveMode() turns it on.
     mcpwm_capture_timer_config_t capTimerConfig = {};
     capTimerConfig.group_id = 0;
     capTimerConfig.clk_src = MCPWM_CAPTURE_CLK_SRC_DEFAULT;
-    // Best-effort hint only: on plain ESP32 the capture timer's clock is hardwired to APB and this
-    // is silently ignored (see the rxCaptureTicksPerUs comment in the header), so don't assume it
-    // took effect -- the actual resolution is read back just below instead.
+    // Best-effort hint only: on plain ESP32 this is ignored (clock is hardwired to APB) -- the
+    // actual resolution is read back just below instead.
     capTimerConfig.resolution_hz = 1'000'000;
     esp_err_t err = mcpwm_new_capture_timer(&capTimerConfig, &this->rxCaptureTimer);
     if (err != ESP_OK)
@@ -356,7 +321,6 @@ void SX1278Driver::configureDioPins()
     capChanConfig.prescale = 1;
     capChanConfig.flags.pos_edge = true;
     capChanConfig.flags.neg_edge = true;
-    // pull_up/pull_down left false: matches GPIO_PULLUP_DISABLE/GPIO_PULLDOWN_DISABLE above.
     err = mcpwm_new_capture_channel(this->rxCaptureTimer, &capChanConfig, &this->rxCaptureChannel);
     if (err != ESP_OK)
     {
@@ -384,8 +348,7 @@ void SX1278Driver::configureDioPins()
         ESP_LOGE(TAG, "Failed to start DIO2 capture timer: %d", err);
         return;
     }
-    // Deliberately not calling mcpwm_capture_channel_enable() here -- a freshly created channel
-    // starts disabled, same as gpio_intr_disable() used to; enterReceiveMode() enables it.
+    // Not enabled here -- a freshly created channel starts disabled; enterReceiveMode() enables it.
 }
 
 void SX1278Driver::configureDebugPins()
@@ -434,8 +397,7 @@ void SX1278Driver::writeFifo(const uint8_t* data, size_t length)
 
 void SX1278Driver::configureRadio()
 {
-    // LongRangeMode can only change while the *target* mode is Sleep, so force that first
-    // regardless of whatever mode the chip happened to power up or warm-reset into.
+    // LongRangeMode can only change while the *target* mode is Sleep, so force that first.
     writeRegister(REG_OP_MODE, 0x00);
     writeRegister(REG_OP_MODE, OPMODE_SLEEP);
     writeRegister(REG_OP_MODE, OPMODE_STANDBY);
@@ -446,18 +408,18 @@ void SX1278Driver::configureRadio()
     writeRegister(REG_FRF_MID, static_cast<uint8_t>(frf >> 8));
     writeRegister(REG_FRF_LSB, static_cast<uint8_t>(frf));
 
-    // Bit rate sets the on-air duration of a single chip in our hand-encoded waveform (see
-    // buildWaveform); it has nothing to do with any "real" data rate.
+    // Bit rate sets the on-air duration of a single chip in our hand-encoded waveform; it has
+    // nothing to do with any "real" data rate.
     uint32_t bitRateReg = static_cast<uint32_t>(FXOSC_HZ / BIT_RATE_BPS + 0.5);
     writeRegister(REG_BITRATE_MSB, static_cast<uint8_t>(bitRateReg >> 8));
     writeRegister(REG_BITRATE_LSB, static_cast<uint8_t>(bitRateReg));
 
-    // PA_BOOST pin, max output power (+17dBm). No modulation shaping: shaping low-pass filters
-    // the OOK edges, which would blur the exact pulse widths this protocol depends on.
+    // PA_BOOST pin, max output power (+17dBm). No modulation shaping: shaping would low-pass
+    // filter the OOK edges, blurring the exact pulse widths this protocol depends on.
     writeRegister(REG_PA_CONFIG, 0x80 | 0x0F);
     writeRegister(REG_PA_RAMP, 0x08); // ModulationShaping=00 (none), PaRamp=50us
 
-    // No preamble/sync word/CRC: the FIFO payload we stream in transmitWaveform() *is* the exact
+    // No preamble/sync word/CRC: the FIFO payload streamed in transmitWaveform() *is* the exact
     // on-air waveform, byte for byte.
     writeRegister(REG_PREAMBLE_MSB, 0x00);
     writeRegister(REG_PREAMBLE_LSB, 0x00);
@@ -466,14 +428,12 @@ void SX1278Driver::configureRadio()
     writeRegister(REG_FIFO_THRESH, FIFO_THRESHOLD); // TxStartCondition=0 (wait for FifoLevel)
 }
 
-// One-time OOK receiver setup. These registers are independent of the Tx/Rx DataMode toggle in
-// enterReceiveMode()/transmitWaveform(), so they only need writing once.
+// One-time OOK receiver setup, independent of the Tx/Rx DataMode toggle in
+// enterReceiveMode()/transmitWaveform().
 void SX1278Driver::configureReceiver()
 {
-    // BitSyncOn=0, OokThreshType=01 (Peak, recommended default). BitSyncOn must be off: our
-    // protocol has no 0x55/0xAA preamble for the bit synchronizer to lock onto, so leaving it on
-    // would gate DIO2/Data to a recovered bit clock we can't produce, instead of the raw envelope
-    // handleReceivedEdge() needs (datasheet section 4.2.3.3/2.1.12.3).
+    // BitSyncOn=0 (no preamble for the bit synchronizer to lock onto -- we need the raw envelope,
+    // not a recovered bit clock), OokThreshType=01 (Peak, recommended default).
     writeRegister(REG_OOK_PEAK, 0x08);
 
     // single-side channel filter bandwidth
@@ -490,18 +450,13 @@ void SX1278Driver::configureReceiver()
     // 0x12	    24	    2	83.3 kHz
     writeRegister(REG_RX_BW, 0x16);
 
-    // Floor threshold for the OOK Peak demodulator: how far above the noise floor DIO2 must rise
-    // before it's treated as a real signal rather than noise. The right value is inherently
-    // specific to this board/antenna/environment -- the datasheet's own recommended procedure
-    // (section 2.1.3.2, "Optimizing the Floor Threshold") is to raise it until DIO2 stops
-    // toggling with no transmitter active. This is only a conservative starting point (double
-    // the POR reset value); use the "sx1278reg" console command to tune it properly on this
-    // hardware without reflashing, e.g. `sx1278reg 0x15 0x20`.
+    // Floor threshold for the OOK Peak demodulator, board/environment-specific -- datasheet
+    // section 2.1.3.2 recommends raising it until DIO2 stops toggling with no transmitter active.
+    // This is only a conservative starting point; tune live via `sx1278reg 0x15 <value>`.
     writeRegister(REG_OOK_FIX, 0x4D);
 
-    // AgcAutoOn=1, RxTrigger=001 (Rssi interrupt): the LNA gain (re-)converges whenever RSSI
-    // crosses the threshold, i.e. whenever a transmission begins after a silent gap -- exactly
-    // the pattern a burst of remote button presses produces during otherwise-idle continuous Rx.
+    // AgcAutoOn=1, RxTrigger=001 (Rssi interrupt): LNA gain reconverges whenever RSSI crosses the
+    // threshold, i.e. whenever a transmission begins after a silent gap.
     writeRegister(REG_RX_CONFIG, 0x09);
 }
 
@@ -509,9 +464,8 @@ void SX1278Driver::init()
 {
     resetChip();
 
-    // See dio2SetupTask()'s comment: runs configureEdgeCounter()/configureDioPins() from core 1 so
-    // their interrupts bind there instead of core 0. This blocks until that task signals completion,
-    // so init() remains synchronous from app_main.cpp's perspective.
+    // See dio2SetupTask(): runs the MCPWM/PCNT setup from core 1. Blocks until it signals
+    // completion so init() stays synchronous from app_main.cpp's perspective.
     SemaphoreHandle_t dio2SetupDone = xSemaphoreCreateBinary();
     Dio2SetupContext dio2SetupContext{ this, dio2SetupDone };
     xTaskCreatePinnedToCore(&SX1278Driver::dio2SetupTask, "sx1278_dio2_setup", DIO2_SETUP_TASK_STACK_WORDS,
@@ -567,8 +521,7 @@ void SX1278Driver::init()
                 &this->senderTaskHandle);
 
     // Flushes a still-pending RX edge once it's survived RX_NOISE_MAX_US without a glitch-close --
-    // see the rxPendingValid comment in the header. Needed so the last edge of a burst (no further
-    // edge ever arrives to confirm it directly) still gets applied.
+    // see rxPendingValid in the header. Needed so the last edge of a burst still gets applied.
     esp_timer_create_args_t noiseTimerArgs = {};
     noiseTimerArgs.callback = &SX1278Driver::noiseTimeoutCallback;
     noiseTimerArgs.arg = this;
@@ -649,10 +602,9 @@ bool SX1278Driver::peekRssiDbm(double& outDbm)
     return true;
 }
 
-// Runs on a dedicated task for the driver's lifetime, invoking the user callback for every frame
-// handleReceivedEdge() finishes decoding. Kept off the ISR entirely: the callback ultimately
-// reaches BlindController (mutexes) and esp_matter (attribute updates), neither of which is
-// ISR-safe.
+// Runs on a dedicated task for the driver's lifetime, invoking the user callback for every
+// decoded frame. Kept off the ISR entirely: the callback reaches BlindController/esp_matter,
+// neither of which is ISR-safe.
 void SX1278Driver::receiverTask(void* arg)
 {
     auto* self = static_cast<SX1278Driver*>(arg);
@@ -667,9 +619,8 @@ void SX1278Driver::receiverTask(void* arg)
 }
 
 // MCPWM capture event callback for DIO2: cap_value/cap_edge are latched atomically by hardware at
-// the instant of the electrical edge (see the comment in configureDioPins()), so unlike the old
-// GPIO-ISR approach this can't misreport an edge's time or level even if this callback itself is
-// delayed in being serviced.
+// the instant of the electrical edge, so this can't misreport an edge's time/level even if the
+// callback itself is delayed.
 bool IRAM_ATTR SX1278Driver::onDio2Capture(mcpwm_cap_channel_handle_t /*capChannel*/,
                                             const mcpwm_capture_event_data_t* edata, void* userCtx)
 {
@@ -678,26 +629,23 @@ bool IRAM_ATTR SX1278Driver::onDio2Capture(mcpwm_cap_channel_handle_t /*capChann
     return self->handleReceivedEdge(edata->cap_value, level);
 }
 
-// Applies one confirmed (not a noise glitch) edge to rxState and returns true, with
-// outCompletedFrame filled in, if it completes a 40-bit frame; Caller must hold rxStateMux; 
-// runs both from ISR context (handleReceivedEdge) and task context (noiseTimeoutCallback), 
-// so it touches nothing but its arguments and rxState.
+// Applies one confirmed (non-glitch) edge to rxState, returning true with outCompletedFrame filled
+// in if it completes a 40-bit frame. Caller must hold rxStateMux; runs from both ISR context
+// (handleReceivedEdge) and task context (noiseTimeoutCallback), so it touches nothing but its
+// arguments and rxState.
 //
-// Reconstructs the same 40-bit Dooya frame buildWaveform() encodes: a HIGH ("mark") run in the
-// SYNC_US range moves to AwaitingSyncGap, the LOW ("space") run that follows it is checked against
-// RX_POST_SYNC_GAP_*_US before frame collection actually starts (this second, independent
-// coincidence is what tells a real sync pulse apart from a noise glitch that happens to land in
-// the SYNC_US window), and every mark after that decodes one payload bit by its duration alone
-// (see the RX_*_US tolerance comment above). Anything that doesn't fit an expected width abandons
-// the in-progress frame and waits for the next sync pulse, so a corrupted/partial reception
-// self-heals on the next button-press repeat instead of needing an explicit timeout.
+// Mirrors buildWaveform()'s encoding: a HIGH ("mark") run in the SYNC_US range moves to
+// AwaitingSyncGap; the LOW ("space") gap that follows is checked against RX_POST_SYNC_GAP_*_US
+// before frame collection starts (a second independent coincidence, to tell a real sync pulse
+// apart from a noise glitch); every mark after that decodes one payload bit by duration alone.
+// Anything that doesn't fit an expected width abandons the in-progress frame and waits for the
+// next sync pulse, so a corrupted reception self-heals on the next button-press repeat.
 bool IRAM_ATTR SX1278Driver::applyEdgeToState(uint32_t edgeTicks, int level, std::array<uint8_t, 5>& outCompletedFrame)
 {
     bool frameComplete = false;
-    // Wraparound-safe: both operands are the same wrapping 32-bit raw tick counter, so plain
-    // unsigned subtraction gives the correct elapsed ticks even across a wrap -- only convert to
-    // microseconds (via rxCaptureTicksPerUs) *after* subtracting; converting each absolute tick
-    // value first would wrap at the wrong modulus (see the header comment on rxCaptureTicksPerUs).
+    // Wraparound-safe: both operands are the same wrapping 32-bit tick counter, so plain unsigned
+    // subtraction is correct across a wrap; only convert to microseconds *after* subtracting (see
+    // rxCaptureTicksPerUs in the header).
     uint32_t deltaTicks = static_cast<uint32_t>(edgeTicks - this->rxState.lastEdgeTicks);
     this->rxState.lastEdgeTicks = edgeTicks;
     this->rxState.lastEdgeLevel = level;
@@ -723,9 +671,7 @@ bool IRAM_ATTR SX1278Driver::applyEdgeToState(uint32_t edgeTicks, int level, std
             }
             else
             {
-                // Falls in a dead zone (or wildly out of range): too ambiguous to guess at, so
-                // abandon this frame rather than risk committing a wrong bit. Self-heals on the
-                // next sync pulse -- either a repeat of the same button press or the next one.
+                // Dead zone (or wildly out of range): too ambiguous to guess, so abandon this frame.
                 haveBit = false;
                 this->rxState.phase = RxState::Phase::Idle;
             }
@@ -755,8 +701,7 @@ bool IRAM_ATTR SX1278Driver::applyEdgeToState(uint32_t edgeTicks, int level, std
     }
     else if (this->rxState.phase == RxState::Phase::AwaitingSyncGap)
     {
-        // Rising edge: the LOW ("space") run that just ended -- the gap right after the sync
-        // mark -- was durationUs long.
+        // Rising edge: the LOW ("space") gap right after the sync mark was durationUs long.
         if (durationUs >= RX_POST_SYNC_GAP_MIN_US && durationUs <= RX_POST_SYNC_GAP_MAX_US)
         {
             this->rxState.phase = RxState::Phase::InFrame;
@@ -772,63 +717,36 @@ bool IRAM_ATTR SX1278Driver::applyEdgeToState(uint32_t edgeTicks, int level, std
     return frameComplete;
 }
 
-// Runs in ISR context (the MCPWM capture channel's callback) on every DIO2 edge while the radio is
-// idling in receive mode (disabled during transmission, see transmitWaveform()). Never applies an
-// edge to rxState directly --
-// a noise glitch looks identical to a real edge until the *next* edge shows how long the run it
-// opened actually lasted, so this only ever buffers the latest edge in rxPendingValid/
-// rxPendingEdgeTicks/rxPendingLevel and lets applyEdgeToState() see it once it's confirmed real:
-//   - if the next edge arrives under RX_NOISE_MAX_US later, the buffered edge and this new one are
-//     both noise -- neither is ever applied, and the buffer is simply cleared;
-//   - if the next edge arrives RX_NOISE_MAX_US or later, the buffered edge survived long enough to
-//     be real -- it's applied now, and this new edge takes its place in the buffer;
-//   - if no next edge arrives at all (the last edge of a burst), rxNoiseTimer's timeout applies it
-//     from noiseTimeoutCallback instead, once RX_NOISE_MAX_US has passed with nothing to glitch it.
-// Returns whether sending the completed-frame queue item woke a higher-priority task, per the
-// mcpwm_capture_event_cb_t contract onDio2Capture() forwards this into: the MCPWM driver's ISR
-// trampoline calls portYIELD_FROM_ISR() itself based on that return value, so this function must
-// not (and no longer does) call it directly.
+// Runs in ISR context on every DIO2 edge while the radio idles in receive mode (disabled during
+// transmission). Never applies an edge to rxState directly, since a glitch looks identical to a
+// real edge until the *next* edge shows how long the run it opened lasted -- instead buffers the
+// latest edge in rxPendingValid/rxPendingEdgeTicks/rxPendingLevel:
+//   - next edge < RX_NOISE_MAX_US later: both edges are noise, buffer is cleared;
+//   - next edge >= RX_NOISE_MAX_US later: the buffered edge is applied, this one takes its place;
+//   - no next edge at all (last edge of a burst): rxNoiseTimer's timeout applies it instead.
+// Returns whether sending the completed-frame queue item woke a higher-priority task; the MCPWM
+// driver's ISR trampoline calls portYIELD_FROM_ISR() itself based on this, so we must not.
 bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
 {
-    //gpio_set_level(SX1278_RX_DEBUG_1_GPIO, level);
-    //gpio_set_level(SX1278_RX_DEBUG_2_GPIO, 1);
-
     bool frameComplete = false;
     std::array<uint8_t, 5> completedFrame{};
 
     portENTER_CRITICAL_ISR(&this->rxStateMux);
 
-    // Spurious duplicate dispatch: MCPWM's capture interrupt is registered via
-    // esp_intr_alloc_intrstatus's shared-interrupt mechanism, which re-reads the group's raw status
-    // register fresh every time the underlying interrupt vector fires (see shared_intr_isr() in
-    // esp-idf's intr_alloc.c). mcpwm_capture_default_isr() clears its status bit with a plain write
-    // and only then reads the separate cap_value/cap_edge latch registers -- if that clear hasn't
-    // yet propagated through to the status register by the time the vector re-triggers (more likely
-    // under the tight back-to-back timing a real glitch produces), the still-set bit causes a
-    // second, spurious call to this function with byte-for-byte identical cap_value/cap_edge, since
-    // no new electrical edge actually happened. A genuine edge can, for all practical purposes,
-    // never land on the exact same capture-timer tick as the previous one, so comparing nowTicks
-    // against rxLastReceivedTicks -- the very last edge this function was actually called with, kept
-    // up to date regardless of whether that edge was applied, buffered, or discarded as a glitch --
-    // reliably tells the two apart. (rxPendingEdgeTicks/rxState.lastEdgeTicks are NOT substitutes for
-    // this: a glitch-cancelled edge updates neither, so right after a glitch is skipped they'd still
-    // point at whatever edge came before it, missing a duplicate of the just-cancelled one entirely.)
-    // Bail out before touching rxIsrEdgeCount/PCNT at all, so the duplicate can't masquerade as a
-    // hardware-dropped edge (the spurious negative-delta HardwareEdgeDropped this was producing).
+    // Spurious duplicate dispatch: MCPWM's shared-interrupt handler can re-fire this callback with
+    // byte-for-byte identical cap_value/cap_edge if its status-bit clear hasn't yet propagated when
+    // the vector re-triggers, even though no new electrical edge happened. 
+    // Bail out before touching rxIsrEdgeCount/PCNT at all.
     if (this->rxLastReceivedLevel != -1 && nowTicks == this->rxLastReceivedTicks && level == this->rxLastReceivedLevel)
     {
         portEXIT_CRITICAL_ISR(&this->rxStateMux);
-        //gpio_set_level(SX1278_RX_DEBUG_2_GPIO, 0);
         return false;
     }
     this->rxLastReceivedTicks = nowTicks;
     this->rxLastReceivedLevel = level;
 
     ++this->rxIsrEdgeCount;
-    // Set when the PCNT reconciliation below fully accounts for this edge itself (see the
-    // HardwareEdgeRecovered case) -- the normal glitch/apply logic further down must not also run
-    // for it, since there's nothing left to buffer or apply: the recovery already decided this
-    // edge's fate.
+    // Set when the PCNT reconciliation below fully accounts for this edge
     bool edgeRecoveredByPcnt = false;
     if (this->rxEdgeCountUnit != nullptr)
     {
@@ -836,36 +754,24 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
         pcnt_unit_get_count(this->rxEdgeCountUnit, &pcntCount);
         if (pcntCount != this->rxIsrEdgeCount)
         {
-            // The edge to compare this one's level against: the still-unconfirmed pending edge if
-            // there is one, otherwise the last edge applyEdgeToState() actually confirmed -- covers
-            // both a glitch racing MCPWM's latch shortly after a real edge (rxPendingValid still
-            // true) *and* one arriving after that pending edge already got applied by rxNoiseTimer,
-            // or cancelled outright as its own glitch (rxPendingValid false either way, but
-            // rxState.lastEdgeLevel still holds the DIO2 line's actual last known-good level). No
-            // reference exists yet only right after enterReceiveMode()/transmitWaveform() resets
-            // rxState, when lastEdgeLevel's sentinel -1 can't match either real level.
             bool haveReferenceLevel = this->rxPendingValid || this->rxState.lastEdgeLevel != -1;
             int referenceLevel = this->rxPendingValid ? this->rxPendingLevel : this->rxState.lastEdgeLevel;
             if (pcntCount == this->rxIsrEdgeCount + 1 && haveReferenceLevel && referenceLevel == level)
             {
-                // The common case: a very short glitch shortly after a real edge raced the MCPWM
-                // capture channel's single latch and overwrote it before the ISR serviced it (see
-                // configureEdgeCounter()) -- exactly one edge is missing. Because DIO2 can only ever
-                // alternate level, and this edge's level matches the reference edge above, the
-                // missing edge must have had the opposite level: together they're a glitch pair that
-                // returns to the reference level, exactly the shape RX_NOISE_MAX_US already discards
-                // below. Recover by treating this edge as that glitch pair's second half -- leave
-                // rxState/the pending buffer exactly as they are (as if neither the missing edge nor
-                // this one ever happened) instead of aborting the whole in-progress frame.
+                // Common case: exactly one edge is missing -- a short glitch  raced MCPWM's single latch 
+                // and overwrote it before the ISR serviced it. 
+                // Since DIO2 can only alternate level and this edge matches the reference level, the
+                // missing edge must have been the opposite level: together they're a glitch pair
+                // that returns to the reference level, the same shape RX_NOISE_MAX_US already
+                // discards below. Recover by leaving rxState/the pending buffer untouched
                 edgeRecoveredByPcnt = true;
             }
             else
             {
                 // MCPWM capture never fired for at least one real DIO2 edge. Whatever is buffered in
-                // rxPendingValid straddles the gap -- its duration was measured against a stale
-                // reference point, so discard it and abandon any in-progress frame instead of letting
-                // a corrupted duration reach applyEdgeToState(); decoding resyncs cleanly on the next
-                // sync pulse, same as the BitInvalid/GapInvalid paths there.
+                // rxPendingValid straddles the gap and was measured against a stale reference point,
+                // so discard it and abandon any in-progress frame; decoding resyncs on the next sync
+                // pulse, same as the BitInvalid/GapInvalid paths in applyEdgeToState().
                 this->rxState.phase = RxState::Phase::Idle;
                 this->rxPendingValid = false;
                 esp_timer_stop(this->rxNoiseTimer);
@@ -873,11 +779,8 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
             this->rxIsrEdgeCount = pcntCount; // re-baseline to hardware ground truth
         }
 
-        // rxIsrEdgeCount is now guaranteed equal to the live PCNT count read above (either they
-        // already matched, or the re-baseline just above made them match) -- periodically reset both
-        // back to 0 together, right here in the same edge that's already touching both, well before
-        // either could approach PCNT_HIGH_LIMIT. No separate watch point/interrupt needed for this:
-        // every edge already polls the live count, so a plain threshold check on it is sufficient.
+        // rxIsrEdgeCount now matches the live PCNT count read above -- periodically reset both back
+        // to 0 together, well before either nears PCNT_HIGH_LIMIT.
         if (this->rxIsrEdgeCount >= PCNT_RESET_THRESHOLD)
         {
             pcnt_unit_clear_count(this->rxEdgeCountUnit);
@@ -888,7 +791,7 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
     if (!edgeRecoveredByPcnt)
     {
         // Wraparound-safe unsigned subtraction on raw ticks, converted to microseconds only after
-        // subtracting -- see the comment on rxCaptureTicksPerUs in the header and in applyEdgeToState().
+        // subtracting -- see rxCaptureTicksPerUs in the header.
         uint32_t glitchDeltaUs = static_cast<uint32_t>(nowTicks - this->rxPendingEdgeTicks) / this->rxCaptureTicksPerUs;
         if (this->rxPendingValid && glitchDeltaUs < RX_NOISE_MAX_US)
         {
@@ -904,20 +807,6 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
                     this->applyEdgeToState(this->rxPendingEdgeTicks, this->rxPendingLevel, completedFrame);
             }
 
-            // Stopped unconditionally, not just when rxPendingValid was set: noiseTimeoutCallback's
-            // timer removes itself from esp_timer's internal alarm list (making it look "unarmed") and
-            // drops esp_timer's own lock *before* it ever touches rxStateMux -- see esp_timer.c's
-            // timer_process_alarm(). So a stale callback can still be in flight, about to apply/clear
-            // whatever is *currently* pending, even after we've moved on to a newer edge here. If that
-            // happens, the fresh timer we armed for this newer edge gets orphaned: still ticking, but
-            // for an edge the stale callback already consumed. Skipping this stop() whenever our own
-            // rxPendingValid happened to read false left esp_timer_start_once() below silently fail
-            // (ESP_ERR_INVALID_STATE, unchecked) on that orphaned timer, so the edge being buffered here
-            // got no flush timer at all -- harmless for most edges (the next edge's arrival still
-            // applies it via the branch above), but fatal for the last mark of a frame, which has no
-            // next edge to rescue it before the next sync pulse's edge shows up and gets misread against
-            // a stale reference point. Calling stop() here regardless -- a no-op if nothing was armed --
-            // guarantees the start_once() below is never rejected as "already armed".
             esp_timer_stop(this->rxNoiseTimer);
 
             this->rxPendingValid = true;
@@ -936,15 +825,12 @@ bool IRAM_ATTR SX1278Driver::handleReceivedEdge(uint32_t nowTicks, int level)
         xQueueSendFromISR(this->rxFrameQueue, &completedFrame, &woken);
         higherPriorityTaskWoken = (woken == pdTRUE);
     }
-    //gpio_set_level(SX1278_RX_DEBUG_2_GPIO, 0);
     return higherPriorityTaskWoken;
 }
 
 // Runs on the esp_timer task, RX_NOISE_MAX_US after the last edge handleReceivedEdge() buffered,
-// unless a closer or a later edge got there first and already cleared rxPendingValid (see there).
-// Applies that edge the same way a confirming next edge would have -- this is what lets the very
-// last edge of a burst (no further DIO2 activity to confirm it) still make it into rxState instead
-// of being silently lost while waiting for an edge that's never coming.
+// unless a closer or later edge already cleared rxPendingValid. Applies that edge the same way a
+// confirming next edge would, so the very last edge of a burst still makes it into rxState.
 void SX1278Driver::noiseTimeoutCallback(void* arg)
 {
     auto* self = static_cast<SX1278Driver*>(arg);
@@ -966,9 +852,8 @@ void SX1278Driver::noiseTimeoutCallback(void* arg)
 }
 
 // Runs on a dedicated task for the driver's lifetime, transmitting queued commands strictly in
-// submission order so callers never wait on air time. Whenever it isn't actively transmitting,
-// it leaves the radio in continuous receive mode listening for the physical remote (see
-// enterReceiveMode()).
+// submission order. Whenever it isn't transmitting, it leaves the radio in continuous receive mode
+// listening for the physical remote (see enterReceiveMode()).
 void SX1278Driver::senderTask(void* arg)
 {
     auto* self = static_cast<SX1278Driver*>(arg);
@@ -987,11 +872,9 @@ void SX1278Driver::senderTask(void* arg)
 
 void SX1278Driver::transmitWaveform(const std::vector<uint8_t>& waveform)
 {
-    // Stop reacting to DIO2 edges and drop out of continuous Rx mode (the sender task may be
-    // calling this while the radio is still listening) before touching any packet-framing
-    // registers below. Also cancel any RX edge still waiting out RX_NOISE_MAX_US -- left alone, its
-    // timeout would otherwise fire mid-transmission and feed a stale, never-really-received edge
-    // into rxState (see rxNoiseTimer).
+    // Stop reacting to DIO2 edges and drop out of continuous Rx before touching any packet-framing
+    // registers below, and cancel any RX edge still waiting out RX_NOISE_MAX_US (left alone, its
+    // timeout would fire mid-transmission and feed a stale edge into rxState).
     esp_err_t err = mcpwm_capture_channel_disable(this->rxCaptureChannel);
     if (err != ESP_OK)
     {
