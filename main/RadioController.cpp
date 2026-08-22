@@ -69,15 +69,19 @@ void RadioController::onFrameReceived(const std::array<uint8_t, 5>& data)
     ESP_LOGI(TAG, "Received remote command %d from remote 0x%06lX channel %d", static_cast<int>(command),
              static_cast<unsigned long>(remoteId), channel);
 
+    bool matched = false;
     for (uint8_t i = 0; i < this->registeredBlindCount; ++i)
     {
         BlindController* blind = this->registeredBlinds[i];
         if (blind->blindRemoteId == remoteId && (blind->blindRadioChannel == channel || channel == 0))
         {
             blind->handleRemoteCommand(command);
-            return;
+            matched = true;
         }
     }
 
-    ESP_LOGD(TAG, "No blind registered for remote 0x%06lX channel %d", static_cast<unsigned long>(remoteId), channel);
+    if (!matched)
+    {
+        ESP_LOGD(TAG, "No blind registered for remote 0x%06lX channel %d", static_cast<unsigned long>(remoteId), channel);
+    }
 }
