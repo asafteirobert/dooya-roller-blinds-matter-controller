@@ -476,14 +476,19 @@ void SX1278Driver::configureReceiver()
     // handleReceivedEdge() needs (datasheet section 4.2.3.3/2.1.12.3).
     writeRegister(REG_OOK_PEAK, 0x08);
 
-    // ~10.4kHz single-side channel filter bandwidth (RxBwMant=24, RxBwExp=5) -- this is the same
-    // bandwidth the datasheet itself quotes its OOK sensitivity figures at (Table 8), and
-    // meaningfully cuts the noise power reaching the demodulator compared to a wider filter,
-    // while still settling far faster than our shortest pulse (SHORT_US=350us). If reception
-    // stops working *entirely* after this change rather than just staying weak, that points at
-    // the remote's actual carrier sitting outside this narrower passband (crystal tolerance)
-    // rather than at noise -- widen it back up (e.g. 0x0B for ~50kHz) to check.
-    writeRegister(REG_RX_BW, 0x15);
+    // single-side channel filter bandwidth
+    // Value	Mant	Exp	Bandwidth
+    // 0x17 	24	    7	2.6 kHz
+    // 0x16	    24	    6	5.2 kHz (current)
+    // 0x15	    24	    5	10.4 kHz
+    // 0x0D	    16	    5	15.6 kHz
+    // 0x14	    24	    4	20.8 kHz
+    // 0x0C	    16	    4	31.25 kHz
+    // 0x0B	    20	    3	50 kHz
+    // 0x13	    24	    3	41.7 kHz
+    // 0x0A	    20	    2	100 kHz
+    // 0x12	    24	    2	83.3 kHz
+    writeRegister(REG_RX_BW, 0x16);
 
     // Floor threshold for the OOK Peak demodulator: how far above the noise floor DIO2 must rise
     // before it's treated as a real signal rather than noise. The right value is inherently
@@ -492,7 +497,7 @@ void SX1278Driver::configureReceiver()
     // toggling with no transmitter active. This is only a conservative starting point (double
     // the POR reset value); use the "sx1278reg" console command to tune it properly on this
     // hardware without reflashing, e.g. `sx1278reg 0x15 0x20`.
-    writeRegister(REG_OOK_FIX, 0x60);
+    writeRegister(REG_OOK_FIX, 0x4D);
 
     // AgcAutoOn=1, RxTrigger=001 (Rssi interrupt): the LNA gain (re-)converges whenever RSSI
     // crosses the threshold, i.e. whenever a transmission begins after a silent gap -- exactly
