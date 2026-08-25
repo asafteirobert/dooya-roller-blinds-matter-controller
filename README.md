@@ -27,7 +27,7 @@ Use the scripts in `mfg-tool-scripts/` to generate and flash per-device commissi
 
 Override the port: `PORT=/dev/ttyACM0 ./2_flash.sh`.
 
-Commissioning QR code (alongside the manual code) can be found in `mfg-tool-scripts/out/fff1_8002/<hash>/<hash>-qrcode.png`.
+Commissioning QR code (alongside the manual code) can be found in `mfg-tool-scripts/out/fff1_8003/<hash>/<hash>-qrcode.png`.
 
 ## Obtaining your unique remote ID code
 
