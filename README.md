@@ -33,7 +33,7 @@ Commissioning QR code (alongside the manual code) can be found in `mfg-tool-scri
 
 Enable debug logging by uncommenting and commenting out the relevant lines in `sdkconfig.defaults` and look for `Received remote command X from remote 0xXXXXX channel X`. Use the script in `tools/write-blind-config` to write the remote ID and channel to the correct Matter endpoint (see below).
 
-Alternatively, you can use an RTL-SDR and the [rtl_433 tool](https://github.com/merbanan/rtl_433) with the `dooya_curtain.conf` file in this repository: `rtl_433.exe -c hardware/dooya_curtain.conf`.
+Alternatively, you can use an RTL-SDR dongle and the [rtl_433 tool](https://github.com/merbanan/rtl_433) tool with the `dooya_curtain.conf` file in this repository: `rtl_433.exe -c hardware/dooya_curtain.conf`.
 
 ## Configuring blinds (tools/write-blind-config)
 
