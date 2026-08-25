@@ -4,7 +4,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-PORT="${1:-${PORT:-/dev/ttyACM0}}"
+PORT="${1:-${PORT:-/dev/ttyUSB0}}"
 
 if ! command -v esptool.py &>/dev/null; then
     echo "Error: esptool.py not found in PATH" >&2
