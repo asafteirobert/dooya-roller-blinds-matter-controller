@@ -59,6 +59,9 @@ node write-blind-config.mjs [--pairing-code <code>] [--endpoint <n>] [--lower <m
 - Any subset of `--lower`/`--rise`/`--channel`/`--remote-id`/`--num-blinds` is fine, as long as at least one is given.
 - `--endpoint` selects which blind's config the first four flags target (default `1`). I can be found in the Matter Server web ui in Home Assistant. Or from the device serial log: `Window covering N created with endpoint_id X`.
 
+## AI Disclaimer
+This project was coded with heavy use of Claude Code
+
 Example — configure blind on endpoint 2 with a 12s lower time, 13s rise time, channel 2, remote ID `0x123456`:
 ```bash
 node write-blind-config.mjs --endpoint 2 --lower 12000 --rise 13000 --channel 2 --remote-id 0x123456
